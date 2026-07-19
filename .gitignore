@@ -1,0 +1,9 @@
+/target/
+*.pdb
+*.log
+*.dll
+*.dll.disabled
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
