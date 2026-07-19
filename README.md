@@ -16,6 +16,8 @@ Summon/
 
 The DLL reads `summon.toml` once during startup. Missing or invalid values fall back to the built-in defaults, and configuration changes require a game restart.
 
+`start_delay_ms = 5000` delays Summon's background initialization by five seconds after the DLL is loaded. This does not block `DllMain` or the game's main thread. Set it to `0` to initialize immediately.
+
 This build targets the supported Elden Ring executable detected by the bundled `eldenring` bindings. Modified or version-mismatched executables are not supported.
 
 ## Default Speffects
@@ -47,6 +49,7 @@ Top-level settings provide defaults for every summon:
 - `vanish_request_speffect`
 - `generated_team_type`
 - `max_active_summons`
+- `start_delay_ms`
 - `unbound_timeout_ms`
 - `fallback_lifetime_ms`
 - `spawn_forward_distance`

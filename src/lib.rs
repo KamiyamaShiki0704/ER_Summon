@@ -45,7 +45,7 @@ pub unsafe extern "C" fn DllMain(hmodule: HINSTANCE, reason: u32, _: *mut c_void
     }
 
     thread::spawn(|| {
-        let _ = settings();
+        thread::sleep(settings().start_delay());
         if wait_for_system_init(&Program::current(), Duration::MAX).is_ok() {
             install_tasks_once();
         }
@@ -179,6 +179,8 @@ struct AttackSummonSettings {
     generated_team_type: u8,
     #[serde(default = "default_max_active_summons")]
     max_active_summons: usize,
+    #[serde(default = "default_start_delay_ms")]
+    start_delay_ms: u64,
     #[serde(default = "default_unbound_timeout_ms")]
     unbound_timeout_ms: u64,
     #[serde(default = "default_fallback_lifetime_ms")]
@@ -206,6 +208,7 @@ impl Default for AttackSummonSettings {
             vanish_request_speffect: default_vanish_request_speffect(),
             generated_team_type: default_generated_team_type(),
             max_active_summons: default_max_active_summons(),
+            start_delay_ms: default_start_delay_ms(),
             unbound_timeout_ms: default_unbound_timeout_ms(),
             fallback_lifetime_ms: default_fallback_lifetime_ms(),
             spawn_forward_distance: default_spawn_forward_distance(),
@@ -220,6 +223,10 @@ impl Default for AttackSummonSettings {
 }
 
 impl AttackSummonSettings {
+    fn start_delay(&self) -> Duration {
+        Duration::from_millis(self.start_delay_ms)
+    }
+
     fn unbound_timeout(&self) -> Duration {
         Duration::from_millis(self.unbound_timeout_ms.max(1))
     }
@@ -762,6 +769,10 @@ fn default_generated_team_type() -> u8 {
 
 fn default_max_active_summons() -> usize {
     8
+}
+
+fn default_start_delay_ms() -> u64 {
+    5_000
 }
 
 fn default_unbound_timeout_ms() -> u64 {
