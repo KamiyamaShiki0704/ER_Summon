@@ -5,8 +5,13 @@ max_active_summons = 8
 start_delay_ms = 5000
 unbound_timeout_ms = 2000
 fallback_lifetime_ms = 10000
-spawn_forward_distance = 2.8
-spawn_height_offset = 0.05
+# Position offsets use camera-local horizontal axes plus world height:
+# offset_forward: positive = toward the camera view direction, negative = backward
+# offset_right: positive = camera-right, negative = camera-left
+# offset_up: positive = upward, negative = downward
+offset_forward = 2.8
+offset_right = 0.0
+offset_up = 0.05
 same_trigger_cooldown_ms = 350
 any_trigger_cooldown_ms = 120
 reuse_spawned_units = true
@@ -15,7 +20,7 @@ disable_lock_on = false
 # The following global fields can also be set inside a [[summons]] entry.
 # Entry values override the global value only for that summon:
 # marker_speffect, vanish_request_speffect, generated_team_type,
-# fallback_lifetime_ms, spawn_forward_distance, spawn_height_offset,
+# fallback_lifetime_ms, offset_forward, offset_right, offset_up,
 # disable_lock_on.
 
 [[summons]]
@@ -27,15 +32,16 @@ npc_think_param_id = 42050000
 event_entity_id = 0
 talk_id = 0
 animation_id = 20010
-side_offset = -1.25
+offset_right = -1.25
 is_player = false
 # Example per-summon overrides:
 # marker_speffect = 14200128
 # vanish_request_speffect = 14200129
 # generated_team_type = 47
 # fallback_lifetime_ms = 10000
-# spawn_forward_distance = 2.8
-# spawn_height_offset = 0.05
+# offset_forward = 2.8
+# offset_right = -1.25
+# offset_up = 0.05
 # disable_lock_on = false
 
 [[summons]]
@@ -47,7 +53,7 @@ npc_think_param_id = 42050000
 event_entity_id = 0
 talk_id = 0
 animation_id = 20011
-side_offset = -0.75
+offset_right = -0.75
 is_player = false
 
 [[summons]]
@@ -59,7 +65,7 @@ npc_think_param_id = 42050000
 event_entity_id = 0
 talk_id = 0
 animation_id = 20012
-side_offset = -0.25
+offset_right = -0.25
 is_player = false
 
 [[summons]]
@@ -71,7 +77,7 @@ npc_think_param_id = 42050000
 event_entity_id = 0
 talk_id = 0
 animation_id = 20013
-side_offset = 0.25
+offset_right = 0.25
 is_player = false
 
 [[summons]]
@@ -83,7 +89,7 @@ npc_think_param_id = 42050000
 event_entity_id = 0
 talk_id = 0
 animation_id = 20017
-side_offset = 0.75
+offset_right = 0.75
 is_player = false
 
 [[summons]]
@@ -95,5 +101,5 @@ npc_think_param_id = 42050000
 event_entity_id = 0
 talk_id = 0
 animation_id = 20018
-side_offset = 1.25
+offset_right = 1.25
 is_player = false

@@ -18,6 +18,7 @@ use eldenring::{
     },
     fd4::FD4TaskData,
     position::HavokPosition,
+    rotation::Quaternion,
     util::system::wait_for_system_init,
 };
 use fromsoftware_shared::{F32Vector4, FromStatic, SharedTaskImpExt, program::Program};
@@ -85,7 +86,8 @@ fn attack_summon_task(_: &FD4TaskData) {
     state.ensure_trigger_slots(settings.summons.len());
     state.update_existing(world_chr_man, now, settings);
 
-    let Some((player_pos, triggers)) = consume_player_triggers(world_chr_man, settings) else {
+    let Some((player_pos, player_yaw, triggers)) = consume_player_triggers(world_chr_man, settings)
+    else {
         state.release_all(world_chr_man);
         return;
     };
@@ -106,6 +108,7 @@ fn attack_summon_task(_: &FD4TaskData) {
             config_index,
             now,
             player_pos,
+            player_yaw,
             forward,
             right,
             settings,
@@ -116,7 +119,7 @@ fn attack_summon_task(_: &FD4TaskData) {
 fn consume_player_triggers(
     world_chr_man: &mut WorldChrMan,
     settings: &AttackSummonSettings,
-) -> Option<(HavokPosition, Vec<usize>)> {
+) -> Option<(HavokPosition, f32, Vec<usize>)> {
     let player = world_chr_man.main_player.as_mut()?;
     let active_effects = player
         .chr_ins
@@ -142,10 +145,18 @@ fn consume_player_triggers(
             .remove_speffect(settings.summons[*index].trigger_speffect);
     }
 
+    let physics = player.chr_ins.modules.as_ref().physics.as_ref();
     Some((
-        player.chr_ins.modules.as_ref().physics.as_ref().position,
+        physics.position,
+        yaw_from_orientation(physics.orientation),
         triggers,
     ))
+}
+
+fn yaw_from_orientation(Quaternion(qx, qy, qz, qw): Quaternion) -> f32 {
+    let forward_x = 2.0 * (qx * qz + qw * qy);
+    let forward_z = 1.0 - 2.0 * (qx * qx + qy * qy);
+    forward_x.atan2(forward_z)
 }
 
 fn camera_horizontal_axes() -> ((f32, f32, f32), (f32, f32, f32)) {
@@ -185,10 +196,12 @@ struct AttackSummonSettings {
     unbound_timeout_ms: u64,
     #[serde(default = "default_fallback_lifetime_ms")]
     fallback_lifetime_ms: u64,
-    #[serde(default = "default_spawn_forward_distance")]
-    spawn_forward_distance: f32,
-    #[serde(default = "default_spawn_height_offset")]
-    spawn_height_offset: f32,
+    #[serde(default = "default_offset_forward", alias = "spawn_forward_distance")]
+    offset_forward: f32,
+    #[serde(default = "default_offset_right")]
+    offset_right: f32,
+    #[serde(default = "default_offset_up", alias = "spawn_height_offset")]
+    offset_up: f32,
     #[serde(default = "default_same_trigger_cooldown_ms")]
     same_trigger_cooldown_ms: u64,
     #[serde(default = "default_any_trigger_cooldown_ms")]
@@ -211,8 +224,9 @@ impl Default for AttackSummonSettings {
             start_delay_ms: default_start_delay_ms(),
             unbound_timeout_ms: default_unbound_timeout_ms(),
             fallback_lifetime_ms: default_fallback_lifetime_ms(),
-            spawn_forward_distance: default_spawn_forward_distance(),
-            spawn_height_offset: default_spawn_height_offset(),
+            offset_forward: default_offset_forward(),
+            offset_right: default_offset_right(),
+            offset_up: default_offset_up(),
             same_trigger_cooldown_ms: default_same_trigger_cooldown_ms(),
             any_trigger_cooldown_ms: default_any_trigger_cooldown_ms(),
             reuse_spawned_units: default_reuse_spawned_units(),
@@ -299,8 +313,6 @@ struct AttackSummonConfig {
     talk_id: i32,
     animation_id: i32,
     #[serde(default)]
-    side_offset: f32,
-    #[serde(default)]
     is_player: bool,
     #[serde(default)]
     marker_speffect: Option<i32>,
@@ -310,10 +322,12 @@ struct AttackSummonConfig {
     generated_team_type: Option<u8>,
     #[serde(default)]
     fallback_lifetime_ms: Option<u64>,
-    #[serde(default)]
-    spawn_forward_distance: Option<f32>,
-    #[serde(default)]
-    spawn_height_offset: Option<f32>,
+    #[serde(default, alias = "spawn_forward_distance")]
+    offset_forward: Option<f32>,
+    #[serde(default, alias = "side_offset")]
+    offset_right: Option<f32>,
+    #[serde(default, alias = "spawn_height_offset")]
+    offset_up: Option<f32>,
     #[serde(default)]
     disable_lock_on: Option<bool>,
 }
@@ -341,14 +355,16 @@ impl AttackSummonConfig {
         )
     }
 
-    fn spawn_forward_distance(&self, settings: &AttackSummonSettings) -> f32 {
-        self.spawn_forward_distance
-            .unwrap_or(settings.spawn_forward_distance)
+    fn offset_forward(&self, settings: &AttackSummonSettings) -> f32 {
+        self.offset_forward.unwrap_or(settings.offset_forward)
     }
 
-    fn spawn_height_offset(&self, settings: &AttackSummonSettings) -> f32 {
-        self.spawn_height_offset
-            .unwrap_or(settings.spawn_height_offset)
+    fn offset_right(&self, settings: &AttackSummonSettings) -> f32 {
+        self.offset_right.unwrap_or(settings.offset_right)
+    }
+
+    fn offset_up(&self, settings: &AttackSummonSettings) -> f32 {
+        self.offset_up.unwrap_or(settings.offset_up)
     }
 
     fn disable_lock_on(&self, settings: &AttackSummonSettings) -> bool {
@@ -416,6 +432,7 @@ impl AttackSummonState {
         config_index: usize,
         now: Instant,
         player_pos: HavokPosition,
+        player_yaw: f32,
         forward: (f32, f32, f32),
         right: (f32, f32, f32),
         settings: &AttackSummonSettings,
@@ -435,7 +452,7 @@ impl AttackSummonState {
 
                 if let Some(handle) = self.summons[index].handle {
                     if let Some(chr) = chr_by_handle_mut(world_chr_man, handle) {
-                        activate_existing_summon(chr, position, config, settings);
+                        activate_existing_summon(chr, position, player_yaw, config, settings);
                         self.summons[index].requested_at = now;
                         self.summons[index].expires_at = now + config.fallback_lifetime(settings);
                         self.summons[index].active = true;
@@ -448,7 +465,14 @@ impl AttackSummonState {
             }
         }
 
-        self.spawn_new(world_chr_man, config_index, now, position, settings);
+        self.spawn_new(
+            world_chr_man,
+            config_index,
+            now,
+            position,
+            player_yaw,
+            settings,
+        );
     }
 
     fn spawn_new(
@@ -457,6 +481,7 @@ impl AttackSummonState {
         config_index: usize,
         now: Instant,
         position: HavokPosition,
+        player_yaw: f32,
         settings: &AttackSummonSettings,
     ) {
         let config = settings.summons[config_index];
@@ -472,6 +497,9 @@ impl AttackSummonState {
             pos_x: position.0,
             pos_y: position.1,
             pos_z: position.2,
+            rot_x: 0.0,
+            rot_y: player_yaw,
+            rot_z: 0.0,
         });
 
         self.summons.push(AttackSummonInstance {
@@ -591,12 +619,12 @@ fn summon_position(
 ) -> HavokPosition {
     HavokPosition(
         player_pos.0
-            + forward.0 * config.spawn_forward_distance(settings)
-            + right.0 * config.side_offset,
-        player_pos.1 + config.spawn_height_offset(settings),
+            + forward.0 * config.offset_forward(settings)
+            + right.0 * config.offset_right(settings),
+        player_pos.1 + config.offset_up(settings),
         player_pos.2
-            + forward.2 * config.spawn_forward_distance(settings)
-            + right.2 * config.side_offset,
+            + forward.2 * config.offset_forward(settings)
+            + right.2 * config.offset_right(settings),
         0.0,
     )
 }
@@ -604,23 +632,33 @@ fn summon_position(
 fn activate_existing_summon(
     chr: &mut ChrIns,
     position: HavokPosition,
+    player_yaw: f32,
     config: AttackSummonConfig,
     settings: &AttackSummonSettings,
 ) {
     chr.remove_speffect(config.vanish_request_speffect(settings));
     prepare_summon(chr, config, settings);
-    move_summon(chr, position);
+    move_summon(chr, position, player_yaw);
     restore_summon_hp(chr);
     chr.modules.as_mut().event.as_mut().request_animation_id = -1;
     chr.modules.as_mut().event.as_mut().request_animation_id = config.animation_id;
 }
 
-fn move_summon(chr: &mut ChrIns, position: HavokPosition) {
+fn move_summon(chr: &mut ChrIns, position: HavokPosition, yaw: f32) {
+    let half_yaw = yaw * 0.5;
+    let orientation = Quaternion(0.0, half_yaw.sin(), 0.0, half_yaw.cos());
     let physics = chr.modules.as_mut().physics.as_mut();
     physics.position = position;
     physics.last_update_position = position;
+    physics.orientation = orientation;
+    physics.interpolated_orientation = orientation;
+    physics.orientation_euler = F32Vector4(0.0, yaw, 0.0, 0.0);
     chr.initial_position = position;
     chr.chunk_position = F32Vector4(position.0, position.1, position.2, 0.0);
+    chr.chr_ctrl
+        .as_mut()
+        .chr_proxy_flags
+        .set_rotation_sync_requested(true);
 }
 
 fn prepare_summon(chr: &mut ChrIns, config: AttackSummonConfig, settings: &AttackSummonSettings) {
@@ -783,11 +821,15 @@ fn default_fallback_lifetime_ms() -> u64 {
     10_000
 }
 
-fn default_spawn_forward_distance() -> f32 {
+fn default_offset_forward() -> f32 {
     2.8
 }
 
-fn default_spawn_height_offset() -> f32 {
+fn default_offset_right() -> f32 {
+    0.0
+}
+
+fn default_offset_up() -> f32 {
     0.05
 }
 
@@ -822,14 +864,14 @@ fn default_summons() -> Vec<AttackSummonConfig> {
             event_entity_id: 0,
             talk_id: 0,
             animation_id: 20010,
-            side_offset: -1.25,
+            offset_right: Some(-1.25),
             is_player: false,
             marker_speffect: None,
             vanish_request_speffect: None,
             generated_team_type: None,
             fallback_lifetime_ms: None,
-            spawn_forward_distance: None,
-            spawn_height_offset: None,
+            offset_forward: None,
+            offset_up: None,
             disable_lock_on: None,
         },
         AttackSummonConfig {
@@ -841,14 +883,14 @@ fn default_summons() -> Vec<AttackSummonConfig> {
             event_entity_id: 0,
             talk_id: 0,
             animation_id: 20011,
-            side_offset: -0.75,
+            offset_right: Some(-0.75),
             is_player: false,
             marker_speffect: None,
             vanish_request_speffect: None,
             generated_team_type: None,
             fallback_lifetime_ms: None,
-            spawn_forward_distance: None,
-            spawn_height_offset: None,
+            offset_forward: None,
+            offset_up: None,
             disable_lock_on: None,
         },
         AttackSummonConfig {
@@ -860,14 +902,14 @@ fn default_summons() -> Vec<AttackSummonConfig> {
             event_entity_id: 0,
             talk_id: 0,
             animation_id: 20012,
-            side_offset: -0.25,
+            offset_right: Some(-0.25),
             is_player: false,
             marker_speffect: None,
             vanish_request_speffect: None,
             generated_team_type: None,
             fallback_lifetime_ms: None,
-            spawn_forward_distance: None,
-            spawn_height_offset: None,
+            offset_forward: None,
+            offset_up: None,
             disable_lock_on: None,
         },
         AttackSummonConfig {
@@ -879,14 +921,14 @@ fn default_summons() -> Vec<AttackSummonConfig> {
             event_entity_id: 0,
             talk_id: 0,
             animation_id: 20013,
-            side_offset: 0.25,
+            offset_right: Some(0.25),
             is_player: false,
             marker_speffect: None,
             vanish_request_speffect: None,
             generated_team_type: None,
             fallback_lifetime_ms: None,
-            spawn_forward_distance: None,
-            spawn_height_offset: None,
+            offset_forward: None,
+            offset_up: None,
             disable_lock_on: None,
         },
         AttackSummonConfig {
@@ -898,14 +940,14 @@ fn default_summons() -> Vec<AttackSummonConfig> {
             event_entity_id: 0,
             talk_id: 0,
             animation_id: 20017,
-            side_offset: 0.75,
+            offset_right: Some(0.75),
             is_player: false,
             marker_speffect: None,
             vanish_request_speffect: None,
             generated_team_type: None,
             fallback_lifetime_ms: None,
-            spawn_forward_distance: None,
-            spawn_height_offset: None,
+            offset_forward: None,
+            offset_up: None,
             disable_lock_on: None,
         },
         AttackSummonConfig {
@@ -917,15 +959,53 @@ fn default_summons() -> Vec<AttackSummonConfig> {
             event_entity_id: 0,
             talk_id: 0,
             animation_id: 20018,
-            side_offset: 1.25,
+            offset_right: Some(1.25),
             is_player: false,
             marker_speffect: None,
             vanish_request_speffect: None,
             generated_team_type: None,
             fallback_lifetime_ms: None,
-            spawn_forward_distance: None,
-            spawn_height_offset: None,
+            offset_forward: None,
+            offset_up: None,
             disable_lock_on: None,
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_legacy_position_field_names() {
+        let settings = toml::from_str::<AttackSummonSettings>(
+            r#"
+spawn_forward_distance = 3.5
+spawn_height_offset = 0.25
+
+[[summons]]
+trigger_speffect = 1
+npc_param_id = 2
+animation_id = 3
+side_offset = -1.5
+"#,
+        )
+        .expect("legacy position fields should remain valid");
+
+        assert_eq!(settings.offset_forward, 3.5);
+        assert_eq!(settings.offset_right, 0.0);
+        assert_eq!(settings.offset_up, 0.25);
+        assert_eq!(settings.summons[0].offset_right, Some(-1.5));
+    }
+
+    #[test]
+    fn distributed_config_uses_valid_position_fields() {
+        let settings = toml::from_str::<AttackSummonSettings>(include_str!("../summon.toml"))
+            .expect("distributed summon.toml should remain valid");
+
+        assert_eq!(settings.offset_forward, 2.8);
+        assert_eq!(settings.offset_right, 0.0);
+        assert_eq!(settings.offset_up, 0.05);
+        assert_eq!(settings.summons.len(), 6);
+    }
 }

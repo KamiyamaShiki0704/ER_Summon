@@ -39,6 +39,8 @@ This build targets the supported Elden Ring executable detected by the bundled `
 
 Trigger Speffects are consumed from the local player as one-shot requests. The generated unit appears relative to the player and camera, plays the configured animation, and ends when it receives the vanish Speffect, dies, disappears, or reaches its fallback lifetime.
 
+New and reused units face the local player's current horizontal facing direction when activated. Position offsets are separate from facing: forward/right use the camera's horizontal local axes, while up uses the world vertical axis.
+
 With `reuse_spawned_units = true`, the DLL keeps one hidden generated entity for each `[[summons]]` entry and reuses it on later triggers. This prevents repeated activations from continuously consuming the debug/enemy character pool.
 
 ## Configuration
@@ -52,8 +54,9 @@ Top-level settings provide defaults for every summon:
 - `start_delay_ms`
 - `unbound_timeout_ms`
 - `fallback_lifetime_ms`
-- `spawn_forward_distance`
-- `spawn_height_offset`
+- `offset_forward`
+- `offset_right`
+- `offset_up`
 - `same_trigger_cooldown_ms`
 - `any_trigger_cooldown_ms`
 - `reuse_spawned_units`
@@ -69,17 +72,25 @@ Each `[[summons]]` entry supports:
 - `event_entity_id`
 - `talk_id`
 - `animation_id`
-- `side_offset`
 - `is_player`
 - `marker_speffect`
 - `vanish_request_speffect`
 - `generated_team_type`
 - `fallback_lifetime_ms`
-- `spawn_forward_distance`
-- `spawn_height_offset`
+- `offset_forward`
+- `offset_right`
+- `offset_up`
 - `disable_lock_on`
 
-The last seven fields are optional per-entry overrides. If omitted, the corresponding top-level value is used.
+The last eight fields are optional per-entry overrides. If omitted, the corresponding top-level value is used.
+
+Position fields use readable local-axis names:
+
+- `offset_forward`: positive moves toward the camera view direction; negative moves backward.
+- `offset_right`: positive moves camera-right; negative moves camera-left.
+- `offset_up`: positive moves upward; negative moves downward.
+
+For compatibility, existing configuration files may still use `spawn_forward_distance`, `side_offset`, and `spawn_height_offset`. Do not define an old and new name for the same axis in one scope.
 
 `disable_lock_on = true` disables lock-on for the whole generated character. It does not target one specific lock-on point ID.
 

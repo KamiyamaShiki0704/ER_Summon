@@ -154,6 +154,8 @@ impl WorldChrMan {
 
         self.debug_chr_creator.init_data.spawn_position =
             F32Vector4(request.pos_x, request.pos_y, request.pos_z, 0.0);
+        self.debug_chr_creator.init_data.spawn_rotation =
+            F32Vector4(request.rot_x, request.rot_y, request.rot_z, 0.0);
 
         self.debug_chr_creator.spawn = true;
     }
@@ -170,6 +172,9 @@ pub struct ChrDebugSpawnRequest {
     pub pos_x: f32,
     pub pos_y: f32,
     pub pos_z: f32,
+    pub rot_x: f32,
+    pub rot_y: f32,
+    pub rot_z: f32,
 }
 
 #[repr(C)]
