@@ -20,21 +20,6 @@ The DLL reads `summon.toml` once during startup. Missing or invalid values fall 
 
 This build targets the supported Elden Ring executable detected by the bundled `eldenring` bindings. Modified or version-mismatched executables are not supported.
 
-## Default Speffects
-
-| Speffect | NPCParam | NPCThinkParam | Animation |
-| --- | ---: | ---: | ---: |
-| `14200120` | `42050100` | `42050000` | `20010` |
-| `14200121` | `42050101` | `42050000` | `20011` |
-| `14200122` | `42050102` | `42050000` | `20012` |
-| `14200123` | `42050103` | `42050000` | `20013` |
-| `14200124` | `42050104` | `42050000` | `20017` |
-| `14200125` | `42050105` | `42050000` | `20018` |
-
-- `14200128` is the default marker applied to generated units.
-- `14200129` is the default vanish request. Apply it near the animation end.
-- Generated units use model `c4205`, CharaInit `0`, and team/type `47` by default.
-
 ## Runtime Behavior
 
 Trigger Speffects are consumed from the local player as one-shot requests. The generated unit appears relative to the player and camera, plays the configured animation, and ends when it receives the vanish Speffect, dies, disappears, or reaches its fallback lifetime.
