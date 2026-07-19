@@ -2,7 +2,7 @@
 name = "nightreign-attack-summon"
 version = "0.14.0"
 edition = "2024"
-repository = "https://github.com/KamiyamaShiki0704/Summon"
+repository = "https://github.com/KamiyamaShiki0704/ER_Summon"
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -17,7 +17,7 @@ members = [
 [workspace.package]
 version = "0.14.0"
 edition = "2024"
-repository = "https://github.com/KamiyamaShiki0704/Summon"
+repository = "https://github.com/KamiyamaShiki0704/ER_Summon"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
