@@ -18,7 +18,15 @@ The DLL reads `summon.toml` once during startup. Missing or invalid values fall 
 
 `start_delay_ms = 5000` delays Summon's background initialization by five seconds after the DLL is loaded. This does not block `DllMain` or the game's main thread. Set it to `0` to initialize immediately.
 
-This build targets the supported Elden Ring executable detected by the bundled `eldenring` bindings. Modified or version-mismatched executables are not supported.
+Supported official executable versions:
+
+- Worldwide `2.7.0.0`
+- Worldwide `2.6.2.0`
+- Japanese `2.6.2.1`
+
+Modified or version-mismatched executables are not supported. On an unrecognized
+version, Summon stops its background initialization before installing tasks or
+accessing summon memory.
 
 ## Runtime Behavior
 

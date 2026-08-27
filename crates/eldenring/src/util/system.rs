@@ -16,6 +16,8 @@ static GLOBAL_HINSTANCE: AtomicPtr<usize> = AtomicPtr::new(0x0 as _);
 pub enum SystemInitError {
     #[error("System initialization timed out")]
     Timeout,
+    #[error("Unsupported executable version")]
+    UnsupportedExecutable,
     #[error("Could not translate RVA to VA")]
     InvalidRva,
 }
@@ -23,9 +25,11 @@ pub enum SystemInitError {
 /// Wait for the system to finish initializing by waiting a global hInstance to be populated for CSWindow.
 /// This happens after the CRT init and after duplicate instance checks.
 pub fn wait_for_system_init(module: &Program, timeout: Duration) -> Result<(), SystemInitError> {
+    let rvas = rva::try_get().map_err(|_| SystemInitError::UnsupportedExecutable)?;
+
     if std::ptr::eq(GLOBAL_HINSTANCE.load(Ordering::Relaxed), 0x0 as _) {
         let va = module
-            .rva_to_va(rva::get().global_hinstance)
+            .rva_to_va(rvas.global_hinstance)
             .map_err(|_| SystemInitError::InvalidRva)?;
 
         GLOBAL_HINSTANCE.store(va as _, Ordering::Relaxed);
