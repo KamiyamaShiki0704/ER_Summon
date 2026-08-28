@@ -6,40 +6,16 @@ repository = "https://github.com/KamiyamaShiki0704/ER_Summon"
 license = "MIT OR Apache-2.0"
 publish = false
 
-[workspace]
-resolver = "2"
-members = [
-    "crates/shared",
-    "crates/shared/stl",
-    "crates/eldenring",
-]
+[dependencies]
+eldenring = { git = "https://github.com/vswarte/fromsoftware-rs.git", rev = "eae96dfec94fd9cf6f9d24813c8d08f72019f243" }
+fromsoftware-shared = { git = "https://github.com/vswarte/fromsoftware-rs.git", rev = "eae96dfec94fd9cf6f9d24813c8d08f72019f243" }
+toml = "1.1.4"
 
-[workspace.package]
-version = "0.14.0"
-edition = "2024"
-repository = "https://github.com/KamiyamaShiki0704/ER_Summon"
-license = "MIT OR Apache-2.0"
-
-[workspace.dependencies]
-fromsoftware-shared = { path = "crates/shared", version = "0.14.0", package = "fromsoftware-shared" }
-fromsoftware-shared-macros = { path = "crates/shared/macros", version = "0.14.0", package = "fromsoftware-shared-macros" }
-fromsoftware-shared-stl = { path = "crates/shared/stl", version = "0.14.0", package = "fromsoftware-shared-stl" }
-eldenring = { path = "crates/eldenring", version = "0.14.0", package = "eldenring" }
-bitflags = "2.11.0"
-thiserror = "1"
-glam = ">= 0.30"
-pelite = "0.10"
-vtable-rs = "0.1.4"
-bitfield = "0.19.2"
-encoding_rs = "0.8.35"
-num_enum = "0.7"
-toml = "1.0.3"
-
-[workspace.dependencies.serde]
+[dependencies.serde]
 version = "1"
 features = ["derive"]
 
-[workspace.dependencies.windows]
+[dependencies.windows]
 version = "0.61"
 features = [
     "Win32_Foundation",
@@ -50,13 +26,6 @@ features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
 ]
-
-[dependencies]
-eldenring.workspace = true
-fromsoftware-shared.workspace = true
-serde.workspace = true
-toml.workspace = true
-windows.workspace = true
 
 [lib]
 name = "summon"

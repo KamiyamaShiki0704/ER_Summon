@@ -21,8 +21,7 @@ The DLL reads `summon.toml` once during startup. Missing or invalid values fall 
 Supported official executable versions:
 
 - Worldwide `2.7.0.0`
-- Worldwide `2.6.2.0`
-- Japanese `2.6.2.1`
+- Japanese `2.7.0.1`
 
 Modified or version-mismatched executables are not supported. On an unrecognized
 version, Summon stops its background initialization before installing tasks or
@@ -99,8 +98,22 @@ Requirements:
 Build from the repository root:
 
 ```powershell
-cargo build --release
+cargo build --release --locked
 ```
+
+The repository does not vendor or use a Git submodule for `fromsoftware-rs`.
+Cargo fetches both `eldenring` and `fromsoftware-shared` directly from the
+upstream repository and pins them to this exact revision:
+
+```text
+https://github.com/vswarte/fromsoftware-rs.git
+eae96dfec94fd9cf6f9d24813c8d08f72019f243
+```
+
+That revision contains the Elden Ring 1.17 RVA and runtime-structure updates.
+`Cargo.lock` records the same full commit, so `--locked` builds cannot silently
+move to a newer upstream revision. The first build needs network access to fetch
+the pinned Git dependency; later builds can use Cargo's local cache.
 
 Output:
 
@@ -112,7 +125,8 @@ Release builds statically link the MSVC CRT, so users do not need to install the
 
 ## License
 
-Licensed under either Apache License 2.0 or MIT, at your option. The bundled `eldenring` and `fromsoftware-shared` bindings retain their upstream license terms.
+Licensed under either Apache License 2.0 or MIT, at your option. The `eldenring`
+and `fromsoftware-shared` Git dependencies retain their upstream license terms.
 
 ## Acknowledgements
 

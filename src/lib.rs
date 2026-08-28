@@ -13,15 +13,17 @@ use std::{
 
 use eldenring::{
     cs::{
-        CSCamExt, CSCamera, CSTaskGroupIndex, CSTaskImp, ChrDebugSpawnRequest, ChrIns, ChrInsExt,
-        FieldInsHandle, WorldChrMan,
+        BlockId, CSCamExt, CSCamera, CSTaskGroupIndex, CSTaskImp, ChrIns, ChrInsExt,
+        FieldInsHandle, FieldInsSelector, WorldChrMan,
     },
     fd4::FD4TaskData,
     position::HavokPosition,
     rotation::Quaternion,
     util::system::wait_for_system_init,
 };
-use fromsoftware_shared::{F32Vector4, FromStatic, SharedTaskImpExt, program::Program};
+use fromsoftware_shared::{
+    F32Vector4, FromStatic, GameVersion, LANG_ID_EN, LANG_ID_JP, SharedTaskImpExt, program::Program,
+};
 use serde::Deserialize;
 use windows::Win32::{
     Foundation::{HINSTANCE, HMODULE},
@@ -30,6 +32,9 @@ use windows::Win32::{
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 const CONFIG_FILE_NAME: &str = "summon.toml";
+const DEBUG_CREATOR_INIT_DATA_SIZE: usize = 0x100;
+const DEBUG_CREATOR_SPAWN_ROTATION_OFFSET: usize = 0x10;
+const DEBUG_CREATOR_ENEMY_TYPE_OFFSET: usize = 0xc8;
 
 static INSTALL_TASKS: Once = Once::new();
 static DLL_MODULE: AtomicIsize = AtomicIsize::new(0);
@@ -47,12 +52,38 @@ pub unsafe extern "C" fn DllMain(hmodule: HINSTANCE, reason: u32, _: *mut c_void
 
     thread::spawn(|| {
         thread::sleep(settings().start_delay());
-        if wait_for_system_init(&Program::current(), Duration::MAX).is_ok() {
+        let program = Program::current();
+        if supported_executable(program) && wait_for_system_init(&program, Duration::MAX).is_ok() {
             install_tasks_once();
         }
     });
 
     1
+}
+
+#[derive(Clone, Copy)]
+enum SupportedErVersion {
+    Ww2700,
+    Jp2701,
+}
+
+impl GameVersion for SupportedErVersion {
+    const NAME: &'static str = "elden ring";
+
+    fn from_lang_version(lang_id: u16, version: &str) -> Option<Self> {
+        match (lang_id, version) {
+            (LANG_ID_EN, "2.7.0.0") => Some(Self::Ww2700),
+            (LANG_ID_JP, "2.7.0.1") => Some(Self::Jp2701),
+            _ => None,
+        }
+    }
+}
+
+fn supported_executable(program: Program<'_>) -> bool {
+    let Program::Mapping(module) = program else {
+        return false;
+    };
+    SupportedErVersion::detect(&module).is_ok()
 }
 
 fn install_tasks_once() {
@@ -486,21 +517,26 @@ impl AttackSummonState {
     ) {
         let config = settings.summons[config_index];
         world_chr_man.debug_chr_creator.last_created_chr = None;
-        world_chr_man.spawn_debug_character(&ChrDebugSpawnRequest {
-            chr_id: config.chr_id,
-            chara_init_param_id: config.chara_init_param_id,
-            npc_param_id: config.npc_param_id,
-            npc_think_param_id: config.npc_think_param_id,
-            event_entity_id: config.event_entity_id,
-            talk_id: config.talk_id,
-            is_player: config.is_player,
-            pos_x: position.0,
-            pos_y: position.1,
-            pos_z: position.2,
-            rot_x: 0.0,
-            rot_y: player_yaw,
-            rot_z: 0.0,
-        });
+        if !spawn_debug_character(
+            world_chr_man,
+            &AttackSummonSpawnRequest {
+                chr_id: config.chr_id,
+                chara_init_param_id: config.chara_init_param_id,
+                npc_param_id: config.npc_param_id,
+                npc_think_param_id: config.npc_think_param_id,
+                event_entity_id: config.event_entity_id,
+                talk_id: config.talk_id,
+                is_player: config.is_player,
+                pos_x: position.0,
+                pos_y: position.1,
+                pos_z: position.2,
+                rot_x: 0.0,
+                rot_y: player_yaw,
+                rot_z: 0.0,
+            },
+        ) {
+            return;
+        }
 
         self.summons.push(AttackSummonInstance {
             config_index,
@@ -581,6 +617,60 @@ impl AttackSummonState {
         }
         self.summons.clear();
     }
+}
+
+struct AttackSummonSpawnRequest {
+    chr_id: i32,
+    chara_init_param_id: i32,
+    npc_param_id: i32,
+    npc_think_param_id: i32,
+    event_entity_id: i32,
+    talk_id: i32,
+    is_player: bool,
+    pos_x: f32,
+    pos_y: f32,
+    pos_z: f32,
+    rot_x: f32,
+    rot_y: f32,
+    rot_z: f32,
+}
+
+fn spawn_debug_character(
+    world_chr_man: &mut WorldChrMan,
+    request: &AttackSummonSpawnRequest,
+) -> bool {
+    let creator = &mut world_chr_man.debug_chr_creator;
+    let init_data = &mut creator.init_data;
+    if std::mem::size_of_val(init_data) != DEBUG_CREATOR_INIT_DATA_SIZE {
+        return false;
+    }
+
+    let mut name_bytes = format!("c{:0>4}", request.chr_id)
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    name_bytes.resize(0x20, 0);
+
+    init_data.name.clone_from_slice(&name_bytes);
+    init_data.chara_init_param_id = request.chara_init_param_id;
+    init_data.npc_param_id = request.npc_param_id;
+    init_data.npc_think_param_id = request.npc_think_param_id;
+    init_data.event_entity_id = request.event_entity_id;
+    init_data.talk_id = request.talk_id;
+    init_data.spawn_position = F32Vector4(request.pos_x, request.pos_y, request.pos_z, 0.0);
+
+    // These fields are private in the pinned fsrs revision. The exact revision and
+    // init-data size guard keep this small bridge tied to its verified layout.
+    unsafe {
+        let base = std::ptr::from_mut(init_data).cast::<u8>();
+        base.add(DEBUG_CREATOR_SPAWN_ROTATION_OFFSET)
+            .cast::<F32Vector4>()
+            .write(F32Vector4(request.rot_x, request.rot_y, request.rot_z, 0.0));
+        base.add(DEBUG_CREATOR_ENEMY_TYPE_OFFSET)
+            .write(u8::from(request.is_player));
+    }
+
+    creator.spawn = true;
+    true
 }
 
 fn summon_should_disappear(
@@ -676,14 +766,17 @@ fn prepare_summon(chr: &mut ChrIns, config: AttackSummonConfig, settings: &Attac
         .data
         .action_flags
         .set_disable_lock_on(config.disable_lock_on(settings));
-    chr.last_hit_by = FieldInsHandle::none();
+    chr.last_hit_by = FieldInsHandle {
+        selector: FieldInsSelector(u32::MAX),
+        block_id: BlockId::none(),
+    };
     chr.load_state.set_extinction_death(false);
     chr.chr_flags1c4.set_is_render_group_enabled(true);
     chr.chr_flags1c5.set_death_flag(false);
     chr.chr_flags1c5.set_enable_render(true);
     chr.chr_flags1c8.set_is_active(true);
     chr.chr_activation_flags.set_activation_enabled(true);
-    let debug_flags = chr.debug_flags_mut();
+    let debug_flags = &mut chr.debug_flags;
     debug_flags.set_force_unloaded(false);
     debug_flags.set_force_loaded(true);
     debug_flags.set_character_disabled(false);
@@ -729,7 +822,7 @@ fn park_summon(
     chr.chr_flags1c5.set_death_flag(false);
     chr.chr_flags1c5.set_enable_render(false);
     chr.chr_flags1c8.set_is_active(true);
-    let debug_flags = chr.debug_flags_mut();
+    let debug_flags = &mut chr.debug_flags;
     debug_flags.set_force_loaded(true);
     debug_flags.set_force_unloaded(false);
     debug_flags.set_character_disabled(false);
@@ -758,7 +851,7 @@ fn release_summon(world_chr_man: &mut WorldChrMan, summon: &AttackSummonInstance
     chr.chr_flags1c5.set_death_flag(true);
     chr.chr_flags1c5.set_enable_render(false);
     chr.chr_flags1c8.set_is_active(false);
-    let debug_flags = chr.debug_flags_mut();
+    let debug_flags = &mut chr.debug_flags;
     debug_flags.set_force_loaded(false);
     debug_flags.set_force_unloaded(true);
     debug_flags.set_character_disabled(true);
@@ -774,7 +867,7 @@ fn release_summon(world_chr_man: &mut WorldChrMan, summon: &AttackSummonInstance
 
 fn chr_dead_or_disabled(chr: &ChrIns) -> bool {
     let data = chr.modules.as_ref().data.as_ref();
-    data.hp <= 0 || chr.chr_flags1c5.death_flag() || chr.debug_flags().character_disabled()
+    data.hp <= 0 || chr.chr_flags1c5.death_flag() || chr.debug_flags.character_disabled()
 }
 
 fn chr_has_speffect(chr: &ChrIns, sp_effect: i32) -> bool {
@@ -979,6 +1072,24 @@ fn default_summons() -> Vec<AttackSummonConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supports_only_the_pinned_fsrs_game_versions() {
+        assert!(SupportedErVersion::from_lang_version(LANG_ID_EN, "2.7.0.0").is_some());
+        assert!(SupportedErVersion::from_lang_version(LANG_ID_JP, "2.7.0.1").is_some());
+        assert!(SupportedErVersion::from_lang_version(LANG_ID_EN, "2.6.2.0").is_none());
+        assert!(SupportedErVersion::from_lang_version(LANG_ID_JP, "2.6.2.1").is_none());
+    }
+
+    #[test]
+    fn pinned_debug_creator_layout_matches_private_field_bridge() {
+        assert_eq!(
+            std::mem::size_of::<eldenring::cs::CSDebugChrCreatorInitData>(),
+            DEBUG_CREATOR_INIT_DATA_SIZE
+        );
+        assert_eq!(DEBUG_CREATOR_SPAWN_ROTATION_OFFSET, 0x10);
+        assert_eq!(DEBUG_CREATOR_ENEMY_TYPE_OFFSET, 0xc8);
+    }
 
     #[test]
     fn accepts_legacy_position_field_names() {
