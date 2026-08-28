@@ -654,6 +654,7 @@ fn move_summon(chr: &mut ChrIns, position: HavokPosition, yaw: f32) {
     physics.interpolated_orientation = orientation;
     physics.orientation_euler = F32Vector4(0.0, yaw, 0.0, 0.0);
     chr.initial_position = position;
+    chr.initial_orientation_euler = F32Vector4(0.0, yaw, 0.0, 0.0);
     chr.chunk_position = F32Vector4(position.0, position.1, position.2, 0.0);
     chr.chr_ctrl
         .as_mut()
