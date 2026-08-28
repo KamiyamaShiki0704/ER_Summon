@@ -682,13 +682,14 @@ fn prepare_summon(chr: &mut ChrIns, config: AttackSummonConfig, settings: &Attac
     chr.chr_flags1c5.set_enable_render(true);
     chr.chr_flags1c8.set_is_active(true);
     chr.chr_activation_flags.set_activation_enabled(true);
-    chr.debug_flags.set_force_unloaded(false);
-    chr.debug_flags.set_force_loaded(true);
-    chr.debug_flags.set_character_disabled(false);
-    chr.debug_flags.set_disabled_updates(false);
-    chr.debug_flags.set_disabled_hit(false);
-    chr.debug_flags.set_disabled_movement(false);
-    chr.debug_flags.set_disabled_secondary_actions(false);
+    let debug_flags = chr.debug_flags_mut();
+    debug_flags.set_force_unloaded(false);
+    debug_flags.set_force_loaded(true);
+    debug_flags.set_character_disabled(false);
+    debug_flags.set_disabled_updates(false);
+    debug_flags.set_disabled_hit(false);
+    debug_flags.set_disabled_movement(false);
+    debug_flags.set_disabled_secondary_actions(false);
     chr.opacity_keyframes_multiplier = 1.0;
     chr.opacity_keyframes_multiplier_previous = 1.0;
     chr.tint_alpha_multiplier = 1.0;
@@ -727,13 +728,14 @@ fn park_summon(
     chr.chr_flags1c5.set_death_flag(false);
     chr.chr_flags1c5.set_enable_render(false);
     chr.chr_flags1c8.set_is_active(true);
-    chr.debug_flags.set_force_loaded(true);
-    chr.debug_flags.set_force_unloaded(false);
-    chr.debug_flags.set_character_disabled(false);
-    chr.debug_flags.set_disabled_updates(false);
-    chr.debug_flags.set_disabled_hit(true);
-    chr.debug_flags.set_disabled_movement(false);
-    chr.debug_flags.set_disabled_secondary_actions(false);
+    let debug_flags = chr.debug_flags_mut();
+    debug_flags.set_force_loaded(true);
+    debug_flags.set_force_unloaded(false);
+    debug_flags.set_character_disabled(false);
+    debug_flags.set_disabled_updates(false);
+    debug_flags.set_disabled_hit(true);
+    debug_flags.set_disabled_movement(false);
+    debug_flags.set_disabled_secondary_actions(false);
     chr.base_transparency = 0.0;
     chr.base_transparency_modifier = 0.0;
     chr.tint_alpha_multiplier = 0.0;
@@ -755,13 +757,14 @@ fn release_summon(world_chr_man: &mut WorldChrMan, summon: &AttackSummonInstance
     chr.chr_flags1c5.set_death_flag(true);
     chr.chr_flags1c5.set_enable_render(false);
     chr.chr_flags1c8.set_is_active(false);
-    chr.debug_flags.set_force_loaded(false);
-    chr.debug_flags.set_force_unloaded(true);
-    chr.debug_flags.set_character_disabled(true);
-    chr.debug_flags.set_disabled_updates(true);
-    chr.debug_flags.set_disabled_hit(true);
-    chr.debug_flags.set_disabled_movement(true);
-    chr.debug_flags.set_disabled_secondary_actions(true);
+    let debug_flags = chr.debug_flags_mut();
+    debug_flags.set_force_loaded(false);
+    debug_flags.set_force_unloaded(true);
+    debug_flags.set_character_disabled(true);
+    debug_flags.set_disabled_updates(true);
+    debug_flags.set_disabled_hit(true);
+    debug_flags.set_disabled_movement(true);
+    debug_flags.set_disabled_secondary_actions(true);
     chr.base_transparency = 0.0;
     chr.base_transparency_modifier = 0.0;
     chr.tint_alpha_multiplier = 0.0;
@@ -770,7 +773,7 @@ fn release_summon(world_chr_man: &mut WorldChrMan, summon: &AttackSummonInstance
 
 fn chr_dead_or_disabled(chr: &ChrIns) -> bool {
     let data = chr.modules.as_ref().data.as_ref();
-    data.hp <= 0 || chr.chr_flags1c5.death_flag() || chr.debug_flags.character_disabled()
+    data.hp <= 0 || chr.chr_flags1c5.death_flag() || chr.debug_flags().character_disabled()
 }
 
 fn chr_has_speffect(chr: &ChrIns, sp_effect: i32) -> bool {

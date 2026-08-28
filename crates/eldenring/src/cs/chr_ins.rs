@@ -298,10 +298,11 @@ pub struct ChrIns {
     unk3a0: usize,
     anim_skeleton_to_model_modifier: usize,
     unk3b0: usize,
+    unk3b8: usize,
     cloth_state: [u8; 0x30],
-    unk3e8: u32,
-    unk3ec: u32,
-    unk3f0: f32,
+    unk3f0: u32,
+    unk3f4: u32,
+    unk3f8: f32,
     /// Squared 3D distance to the main player character.
     pub distance_to_player_sqr: f32,
     /// Squared horizontal distance to the main player
@@ -314,7 +315,7 @@ pub struct ChrIns {
     pub chr_activate_threshold: f32,
     /// Final update priority used to sort characters for updates, lower is higher priority.
     pub update_priority: f32,
-    unk40c: u32,
+    unk414: u32,
     update_data_module_task: CSEzVoidTask<CSEzRabbitNoUpdateTask, ChrIns>,
     update_chr_ctrl_task: CSEzVoidTask<CSEzRabbitNoUpdateTask, ChrIns>,
     update_chr_model_task: CSEzVoidTask<CSEzRabbitNoUpdateTask, ChrIns>,
@@ -329,9 +330,58 @@ pub struct ChrIns {
     /// Param ID of the current material character standing on
     /// (e.g. water, lava, etc.), -1 if none.
     pub hit_material_override: i32,
-    unk540: u32,
+    unk548: u32,
     pub debug_role_param_id: i32,
-    unk548: [u8; 0x38],
+    unk550: [u8; 0x30],
+}
+
+impl ChrIns {
+    const DEBUG_FLAGS_PRE_117_OFFSET: usize = 0x530;
+    const DEBUG_FLAGS_117_OFFSET: usize = 0x538;
+    const DEBUG_ROLE_PARAM_PRE_117_OFFSET: usize = 0x544;
+    const DEBUG_ROLE_PARAM_117_OFFSET: usize = 0x54c;
+
+    fn versioned_tail_offset(pre_117: usize, current: usize) -> usize {
+        if crate::rva::uses_chr_ins_117_layout() {
+            current
+        } else {
+            pre_117
+        }
+    }
+
+    pub fn debug_flags(&self) -> &ChrDebugFlags {
+        let offset = Self::versioned_tail_offset(
+            Self::DEBUG_FLAGS_PRE_117_OFFSET,
+            Self::DEBUG_FLAGS_117_OFFSET,
+        );
+        unsafe {
+            &*((self as *const Self)
+                .cast::<u8>()
+                .add(offset)
+                .cast::<ChrDebugFlags>())
+        }
+    }
+
+    pub fn debug_flags_mut(&mut self) -> &mut ChrDebugFlags {
+        let offset = Self::versioned_tail_offset(
+            Self::DEBUG_FLAGS_PRE_117_OFFSET,
+            Self::DEBUG_FLAGS_117_OFFSET,
+        );
+        unsafe {
+            &mut *((self as *mut Self)
+                .cast::<u8>()
+                .add(offset)
+                .cast::<ChrDebugFlags>())
+        }
+    }
+
+    fn versioned_debug_role_param_id(&self) -> i32 {
+        let offset = Self::versioned_tail_offset(
+            Self::DEBUG_ROLE_PARAM_PRE_117_OFFSET,
+            Self::DEBUG_ROLE_PARAM_117_OFFSET,
+        );
+        unsafe { *((self as *const Self).cast::<u8>().add(offset).cast::<i32>()) }
+    }
 }
 
 #[for_all_subclasses]
@@ -379,8 +429,8 @@ pub impl ChrInsExt for Subclass<ChrIns> {
         vow_type: u8,
         from_group_password: bool,
     ) -> i32 {
-        if self.superclass().debug_flags.use_debug_role_param() {
-            self.superclass().debug_role_param_id
+        if self.superclass().debug_flags().use_debug_role_param() {
+            self.superclass().versioned_debug_role_param_id()
         } else {
             let base = (if from_group_password { 100 } else { 0 }) + vow_type as u32;
             base.saturating_mul(10_000)
@@ -1067,4 +1117,21 @@ pub enum ChrType {
     BloodyFingerNpc = 20,
     RecusantNpc = 21,
     Unk22 = 22,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::mem::{offset_of, size_of};
+
+    use super::ChrIns;
+
+    #[test]
+    fn chr_ins_117_layout_matches_runtime_offsets() {
+        assert_eq!(offset_of!(ChrIns, unk3b8), 0x3b8);
+        assert_eq!(offset_of!(ChrIns, cloth_state), 0x3c0);
+        assert_eq!(offset_of!(ChrIns, distance_to_player_sqr), 0x3fc);
+        assert_eq!(offset_of!(ChrIns, debug_flags), 0x538);
+        assert_eq!(offset_of!(ChrIns, debug_role_param_id), 0x54c);
+        assert_eq!(size_of::<ChrIns>(), 0x580);
+    }
 }

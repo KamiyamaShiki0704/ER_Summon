@@ -40,14 +40,26 @@ impl ERGameVersion {
             Self::Jp2621 => rva_jp::RVAS,
         }
     }
+
+    const fn uses_chr_ins_117_layout(self) -> bool {
+        matches!(self, Self::Ww270)
+    }
 }
 
-fn detected() -> &'static Result<RvaBundle, DetectError> {
-    static RVAS: LazyLock<Result<RvaBundle, DetectError>> = LazyLock::new(|| {
+struct DetectedRvas {
+    version: ERGameVersion,
+    rvas: RvaBundle,
+}
+
+fn detected() -> &'static Result<DetectedRvas, DetectError> {
+    static RVAS: LazyLock<Result<DetectedRvas, DetectError>> = LazyLock::new(|| {
         let module = unsafe {
             PeView::module(GetModuleHandleA(PCSTR(std::ptr::null())).unwrap().0 as *const u8)
         };
-        ERGameVersion::detect(&module).map(ERGameVersion::rvas)
+        ERGameVersion::detect(&module).map(|version| DetectedRvas {
+            version,
+            rvas: version.rvas(),
+        })
     });
 
     &RVAS
@@ -55,9 +67,16 @@ fn detected() -> &'static Result<RvaBundle, DetectError> {
 
 pub(crate) fn try_get() -> Result<&'static RvaBundle, &'static DetectError> {
     match detected() {
-        Ok(rvas) => Ok(rvas),
+        Ok(detected) => Ok(&detected.rvas),
         Err(error) => Err(error),
     }
+}
+
+pub(crate) fn uses_chr_ins_117_layout() -> bool {
+    matches!(
+        detected(),
+        Ok(detected) if detected.version.uses_chr_ins_117_layout()
+    )
 }
 
 /// Returns the RVA bundle for the current executable region and version.
@@ -73,14 +92,17 @@ mod tests {
 
     #[test]
     fn recognizes_ww_270_profile() {
-        let rvas = ERGameVersion::from_lang_version(LANG_ID_EN, "2.7.0.0")
-            .expect("WW 2.7.0.0 should be recognized")
-            .rvas();
+        let version = ERGameVersion::from_lang_version(LANG_ID_EN, "2.7.0.0")
+            .expect("WW 2.7.0.0 should be recognized");
+        let rvas = version.rvas();
 
         assert_eq!(rvas.global_hinstance, 0x3d89708);
         assert_eq!(rvas.register_task, 0xeb3de0);
         assert_eq!(rvas.chr_ins_apply_speffect, 0x3e8dc0);
         assert_eq!(rvas.chr_ins_remove_speffect, 0x3ee2e0);
+        assert!(version.uses_chr_ins_117_layout());
+        assert!(!ERGameVersion::Ww262.uses_chr_ins_117_layout());
+        assert!(!ERGameVersion::Jp2621.uses_chr_ins_117_layout());
     }
 
     #[test]
