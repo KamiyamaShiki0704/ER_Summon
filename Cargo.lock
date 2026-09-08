@@ -70,7 +70,7 @@ checksum = "c2ea6706d74fca54e15f1d40b5cf7fe7f764aaec61352a9fcec58fe27e042fc8"
 [[package]]
 name = "eldenring"
 version = "0.14.0"
-source = "git+https://github.com/vswarte/fromsoftware-rs.git?rev=eae96dfec94fd9cf6f9d24813c8d08f72019f243#eae96dfec94fd9cf6f9d24813c8d08f72019f243"
+source = "git+https://github.com/KamiyamaShiki0704/fromsoftware-rs?rev=02fa5681e27fd2ecd9da79d34aef9fae96805539#02fa5681e27fd2ecd9da79d34aef9fae96805539"
 dependencies = [
  "bitfield",
  "bitflags",
@@ -116,7 +116,7 @@ dependencies = [
 [[package]]
 name = "fromsoftware-shared"
 version = "0.14.0"
-source = "git+https://github.com/vswarte/fromsoftware-rs.git?rev=eae96dfec94fd9cf6f9d24813c8d08f72019f243#eae96dfec94fd9cf6f9d24813c8d08f72019f243"
+source = "git+https://github.com/KamiyamaShiki0704/fromsoftware-rs?rev=02fa5681e27fd2ecd9da79d34aef9fae96805539#02fa5681e27fd2ecd9da79d34aef9fae96805539"
 dependencies = [
  "bitflags",
  "from-singleton",
@@ -132,7 +132,7 @@ dependencies = [
 [[package]]
 name = "fromsoftware-shared-macros"
 version = "0.14.0"
-source = "git+https://github.com/vswarte/fromsoftware-rs.git?rev=eae96dfec94fd9cf6f9d24813c8d08f72019f243#eae96dfec94fd9cf6f9d24813c8d08f72019f243"
+source = "git+https://github.com/KamiyamaShiki0704/fromsoftware-rs?rev=02fa5681e27fd2ecd9da79d34aef9fae96805539#02fa5681e27fd2ecd9da79d34aef9fae96805539"
 dependencies = [
  "inflections",
  "proc-macro2",
@@ -143,7 +143,7 @@ dependencies = [
 [[package]]
 name = "fromsoftware-shared-stl"
 version = "0.14.0"
-source = "git+https://github.com/vswarte/fromsoftware-rs.git?rev=eae96dfec94fd9cf6f9d24813c8d08f72019f243#eae96dfec94fd9cf6f9d24813c8d08f72019f243"
+source = "git+https://github.com/KamiyamaShiki0704/fromsoftware-rs?rev=02fa5681e27fd2ecd9da79d34aef9fae96805539#02fa5681e27fd2ecd9da79d34aef9fae96805539"
 
 [[package]]
 name = "fxhash"

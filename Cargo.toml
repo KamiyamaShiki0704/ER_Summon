@@ -7,8 +7,8 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-eldenring = { git = "https://github.com/vswarte/fromsoftware-rs.git", rev = "eae96dfec94fd9cf6f9d24813c8d08f72019f243" }
-fromsoftware-shared = { git = "https://github.com/vswarte/fromsoftware-rs.git", rev = "eae96dfec94fd9cf6f9d24813c8d08f72019f243" }
+eldenring = { git = "https://github.com/KamiyamaShiki0704/fromsoftware-rs", rev = "02fa5681e27fd2ecd9da79d34aef9fae96805539" }
+fromsoftware-shared = { git = "https://github.com/KamiyamaShiki0704/fromsoftware-rs", rev = "02fa5681e27fd2ecd9da79d34aef9fae96805539" }
 toml = "1.1.4"
 
 [dependencies.serde]

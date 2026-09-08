@@ -64,6 +64,7 @@ pub unsafe extern "C" fn DllMain(hmodule: HINSTANCE, reason: u32, _: *mut c_void
 #[derive(Clone, Copy)]
 enum SupportedErVersion {
     Ww2700,
+    Ww2710,
     Jp2701,
 }
 
@@ -73,6 +74,7 @@ impl GameVersion for SupportedErVersion {
     fn from_lang_version(lang_id: u16, version: &str) -> Option<Self> {
         match (lang_id, version) {
             (LANG_ID_EN, "2.7.0.0") => Some(Self::Ww2700),
+            (LANG_ID_EN, "2.7.1.0") => Some(Self::Ww2710),
             (LANG_ID_JP, "2.7.0.1") => Some(Self::Jp2701),
             _ => None,
         }
@@ -1075,6 +1077,9 @@ mod tests {
 
     #[test]
     fn supports_only_the_pinned_fsrs_game_versions() {
+        assert!(SupportedErVersion::from_lang_version(LANG_ID_EN, "2.7.1.0").is_some());
+        assert!(SupportedErVersion::from_lang_version(LANG_ID_JP, "2.7.1.1").is_none());
+        assert!(SupportedErVersion::from_lang_version(LANG_ID_EN, "2.8.0.0").is_none());
         assert!(SupportedErVersion::from_lang_version(LANG_ID_EN, "2.7.0.0").is_some());
         assert!(SupportedErVersion::from_lang_version(LANG_ID_JP, "2.7.0.1").is_some());
         assert!(SupportedErVersion::from_lang_version(LANG_ID_EN, "2.6.2.0").is_none());
@@ -1083,6 +1088,9 @@ mod tests {
 
     #[test]
     fn pinned_debug_creator_layout_matches_private_field_bridge() {
+        assert_eq!(std::mem::size_of::<ChrIns>(), 0x580);
+        assert_eq!(std::mem::offset_of!(ChrIns, debug_flags), 0x538);
+        assert_eq!(std::mem::offset_of!(ChrIns, debug_role_param_id), 0x54c);
         assert_eq!(
             std::mem::size_of::<eldenring::cs::CSDebugChrCreatorInitData>(),
             DEBUG_CREATOR_INIT_DATA_SIZE

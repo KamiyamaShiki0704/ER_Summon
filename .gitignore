@@ -1,4 +1,6 @@
 /target/
+/PLANS.md
+/TASK_STATUS.md
 *.pdb
 *.log
 *.dll

@@ -21,6 +21,7 @@ The DLL reads `summon.toml` once during startup. Missing or invalid values fall 
 Supported official executable versions:
 
 - Worldwide `2.7.0.0`
+- Worldwide `2.7.1.0` (App Ver. 1.17.1)
 - Japanese `2.7.0.1`
 
 Modified or version-mismatched executables are not supported. On an unrecognized
@@ -106,11 +107,13 @@ Cargo fetches both `eldenring` and `fromsoftware-shared` directly from the
 upstream repository and pins them to this exact revision:
 
 ```text
-https://github.com/vswarte/fromsoftware-rs.git
-eae96dfec94fd9cf6f9d24813c8d08f72019f243
+https://github.com/KamiyamaShiki0704/fromsoftware-rs
+02fa5681e27fd2ecd9da79d34aef9fae96805539
 ```
 
-That revision contains the Elden Ring 1.17 RVA and runtime-structure updates.
+That fork revision preserves the validated Elden Ring 1.17 character layout
+and adds the five verified WW 1.17.1 RVA changes. Japanese 1.17.1 is not yet
+verified; Japanese 1.17.0 remains supported.
 `Cargo.lock` records the same full commit, so `--locked` builds cannot silently
 move to a newer upstream revision. The first build needs network access to fetch
 the pinned Git dependency; later builds can use Cargo's local cache.
