@@ -373,17 +373,8 @@ fn clear_chr_set_entry(entry: NonNull<ChrSetEntry<ChrIns>>) {
 /// The caller must have made the character inert beforehand; see the staged
 /// removal path in the main module.
 pub(crate) fn destroy_summon(world_chr_man: &mut WorldChrMan, handle: FieldInsHandle) -> DestroyOutcome {
-    let lookup = lookup_entry(world_chr_man, handle);
-    let chr_ptr = match lookup {
-        EntryLookup::Resolved(_) => {
-            let Some(chr_ptr) = world_chr_man
-                .chr_ins_by_handle_mut(&handle)
-                .map(|chr| chr as *mut ChrIns)
-            else {
-                return DestroyOutcome::NotFound;
-            };
-            chr_ptr
-        }
+    let entry = match lookup_entry(world_chr_man, handle) {
+        EntryLookup::Resolved(resolved) => resolved.entry,
         EntryLookup::Mismatch => return DestroyOutcome::EntryMismatch,
         EntryLookup::Unavailable => {
             // The handle no longer resolves. If a slot is still reachable it is a
@@ -402,9 +393,13 @@ pub(crate) fn destroy_summon(world_chr_man: &mut WorldChrMan, handle: FieldInsHa
         }
     };
 
-    let entry = match lookup_entry(world_chr_man, handle) {
-        EntryLookup::Resolved(resolved) => resolved.entry,
-        _ => return DestroyOutcome::EntryMismatch,
+    // Resolved means the engine hands this character out for this handle, so the
+    // pointer below is the one the engine itself would act on.
+    let Some(chr_ptr) = world_chr_man
+        .chr_ins_by_handle_mut(&handle)
+        .map(|chr| chr as *mut ChrIns)
+    else {
+        return DestroyOutcome::NotFound;
     };
 
     // The mapping sweep has to run while the character is still reachable, since
