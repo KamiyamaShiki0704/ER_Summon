@@ -4,7 +4,9 @@ generated_team_type = 47
 max_active_summons = 8
 start_delay_ms = 5000
 unbound_timeout_ms = 2000
-fallback_lifetime_ms = 10000
+# -1: no timeout; remove on death or vanish_request_speffect.
+# Nonnegative values: lifetime in milliseconds (0 retains the 1 ms minimum).
+fallback_lifetime_ms = -1
 # Position offsets use camera-local horizontal axes plus world height:
 # offset_forward: positive = toward the camera view direction, negative = backward
 # offset_right: positive = camera-right, negative = camera-left
@@ -14,7 +16,7 @@ offset_right = 0.0
 offset_up = 0.05
 same_trigger_cooldown_ms = 350
 any_trigger_cooldown_ms = 120
-reuse_spawned_units = true
+reuse_spawned_units = false
 disable_lock_on = false
 
 # How a summon leaves the world:
@@ -25,8 +27,8 @@ disable_lock_on = false
 #                         reused, which is the older behavior.
 remove_mode = "destroy"
 
-# Grace period between making a unit inert and freeing it. 0 destroys on the
-# next tick; raise it if another system still needs to observe the unit.
+# Minimum delay before frame-end detachment; actual release also waits for
+# references to drain. Zero does not force immediate deallocation.
 destroy_delay_ms = 0
 
 # Writes each configured event_entity_id onto the summon and registers it in the

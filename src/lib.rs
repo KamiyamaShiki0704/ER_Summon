@@ -1,4 +1,5 @@
 mod chr_lifecycle;
+mod retirement;
 
 use std::{
     ffi::{OsString, c_void},
@@ -8,15 +9,15 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         LazyLock, Mutex, Once, OnceLock,
-        atomic::{AtomicIsize, Ordering},
+        atomic::{AtomicIsize, AtomicU32, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
 };
 
 use chr_lifecycle::{
-    DestroyOutcome, EntityIdOutcome, character_reports_event_entity_id, chr_set_usage, destroy_summon,
-    entity_id_owner, register_event_entity_id, release_summon_event_ids,
+    DestroyOutcome, EntityIdOutcome, character_reports_event_entity_id, chr_set_usage,
+    destroy_summon, entity_id_owner, register_event_entity_id, release_summon_event_ids,
 };
 
 use eldenring::{
@@ -51,6 +52,13 @@ static SETTINGS: OnceLock<AttackSummonSettings> = OnceLock::new();
 static LOG: LazyLock<Mutex<Option<fs::File>>> = LazyLock::new(|| Mutex::new(None));
 static STATE: LazyLock<Mutex<AttackSummonState>> =
     LazyLock::new(|| Mutex::new(AttackSummonState::default()));
+// Temporary, bounded diagnostics for the stalled FrameEnd path. These counters
+// observe dispatch only; they must never authorize destruction on another group.
+static RETIREMENT_CALLBACKS: AtomicU64 = AtomicU64::new(0);
+static RETIREMENT_ACCEPTED: AtomicU64 = AtomicU64::new(0);
+static RETIREMENT_GROUP: AtomicU32 = AtomicU32::new(u32::MAX);
+static RETIREMENT_STATUS: AtomicU32 = AtomicU32::new(0);
+static RETIREMENT_REPORT_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Appends a line to `summon.log` next to the DLL.
 ///
@@ -138,10 +146,14 @@ fn install_tasks_once() {
             CSTaskGroupIndex::ChrIns_PostPhysics,
         );
         std::mem::forget(attack_summon);
+        let retirement_task = task_imp.run_recurring(
+            retirement_frame_end as fn(&FD4TaskData), CSTaskGroupIndex::FrameEnd,
+        );
+        std::mem::forget(retirement_task);
 
         let settings = settings();
         log_line(format_args!(
-            "summon initialised: remove_mode={:?} register_event_entity_id={} \
+            "summon initialised: retirement=frame-end-v3 entity_registration=native-groups-v1 remove_mode={:?} register_event_entity_id={} \
              effective_reuse={} destroy_delay_ms={} summons={}",
             settings.remove_mode,
             settings.register_event_entity_id,
@@ -152,9 +164,64 @@ fn install_tasks_once() {
     });
 }
 
+fn is_retirement_frame_end(group: u32) -> bool {
+    // Registration takes an ordinal, but the pinned WW2.7.1.0 game supplies
+    // 0x900000A8 to this FrameEnd callback (diag1 live evidence). Accept only
+    // that observed encoding and the plain ordinal; do not broadly mask bits
+    // whose meaning has not been established for other scheduler groups.
+    group == CSTaskGroupIndex::FrameEnd as u32 || group == 0x9000_00a8
+}
+
+#[cfg(test)]
+mod retirement_dispatch_tests {
+    #[test]
+    fn accepts_observed_frame_end_id_but_rejects_other_groups() {
+        // Exact FD4TaskData value from the failed diag1 live session.
+        assert!(super::is_retirement_frame_end(2_415_919_272));
+        assert!(super::is_retirement_frame_end(168));
+        for group in [0, 167, 169, 0x9000_00a7, 0x9000_00a9, 0x8000_00a8, u32::MAX] {
+            assert!(!super::is_retirement_frame_end(group));
+        }
+    }
+}
+
+fn retirement_frame_end(data: &FD4TaskData) {
+    let first = RETIREMENT_CALLBACKS.fetch_add(1, Ordering::Relaxed) == 0;
+    RETIREMENT_GROUP.store(data.task_group_id, Ordering::Relaxed);
+    if first {
+        log_line(format_args!(
+            "[DEBUG-retirement-dispatch] first-callback observed_group={} expected_group={}",
+            data.task_group_id, CSTaskGroupIndex::FrameEnd as u32
+        ));
+    }
+    if !is_retirement_frame_end(data.task_group_id) {
+        RETIREMENT_STATUS.store(1, Ordering::Relaxed);
+        return;
+    }
+    RETIREMENT_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+    let Ok(world) = (unsafe { WorldChrMan::instance_mut() }) else {
+        RETIREMENT_STATUS.store(2, Ordering::Relaxed);
+        return;
+    };
+    if world.main_player.is_none() {
+        RETIREMENT_STATUS.store(3, Ordering::Relaxed);
+        retirement::quarantine_all("player-unavailable");
+        return;
+    }
+    let Ok(mut state) = STATE.lock() else {
+        RETIREMENT_STATUS.store(4, Ordering::Relaxed);
+        return;
+    };
+    RETIREMENT_STATUS.store(5, Ordering::Relaxed);
+    retirement::poll(world);
+    state.finish_pending_destruction(world, Instant::now());
+    RETIREMENT_STATUS.store(6, Ordering::Relaxed);
+}
+
 fn attack_summon_task(_: &FD4TaskData) {
     let settings = settings();
     let Ok(world_chr_man) = (unsafe { WorldChrMan::instance_mut() }) else {
+        retirement::quarantine_all("world-unavailable");
         if let Ok(mut state) = STATE.lock() {
             state.summons.clear();
         }
@@ -168,13 +235,28 @@ fn attack_summon_task(_: &FD4TaskData) {
 
     state.ensure_trigger_slots(settings.summons.len());
     state.update_existing(world_chr_man, now, settings);
+    let staged = state.summons.iter().filter(|s| s.destroy_at.is_some()).count();
+    if staged > 0 {
+        if let Ok(mut report_at) = RETIREMENT_REPORT_AT.lock() {
+            if report_at.is_none_or(|at| now >= at) {
+                *report_at = Some(now + Duration::from_secs(5));
+                log_line(format_args!(
+                    "[DEBUG-retirement-dispatch] staged={} callbacks={} accepted={} observed_group={} expected_group={} status={} (0=not-called,1=group-rejected,2=no-world,3=no-player,4=lock-poisoned,5=processing,6=completed)",
+                    staged, RETIREMENT_CALLBACKS.load(Ordering::Relaxed),
+                    RETIREMENT_ACCEPTED.load(Ordering::Relaxed),
+                    RETIREMENT_GROUP.load(Ordering::Relaxed), CSTaskGroupIndex::FrameEnd as u32,
+                    RETIREMENT_STATUS.load(Ordering::Relaxed),
+                ));
+            }
+        }
+    }
 
     let Some((player_pos, player_yaw, triggers)) = consume_player_triggers(world_chr_man, settings)
     else {
         state.release_all(world_chr_man, settings);
         return;
     };
-    if triggers.is_empty() {
+    if triggers.is_empty() || retirement::pending() {
         return;
     }
 
@@ -290,7 +372,7 @@ struct AttackSummonSettings {
     #[serde(default = "default_unbound_timeout_ms")]
     unbound_timeout_ms: u64,
     #[serde(default = "default_fallback_lifetime_ms")]
-    fallback_lifetime_ms: u64,
+    fallback_lifetime_ms: i64,
     #[serde(default = "default_offset_forward", alias = "spawn_forward_distance")]
     offset_forward: f32,
     #[serde(default = "default_offset_right")]
@@ -439,7 +521,7 @@ struct AttackSummonConfig {
     #[serde(default)]
     generated_team_type: Option<u8>,
     #[serde(default)]
-    fallback_lifetime_ms: Option<u64>,
+    fallback_lifetime_ms: Option<i64>,
     #[serde(default, alias = "spawn_forward_distance")]
     offset_forward: Option<f32>,
     #[serde(default, alias = "side_offset")]
@@ -465,12 +547,17 @@ impl AttackSummonConfig {
             .unwrap_or(settings.generated_team_type)
     }
 
-    fn fallback_lifetime(&self, settings: &AttackSummonSettings) -> Duration {
-        Duration::from_millis(
-            self.fallback_lifetime_ms
-                .unwrap_or(settings.fallback_lifetime_ms)
-                .max(1),
-        )
+    fn expires_at(&self, settings: &AttackSummonSettings, now: Instant) -> Option<Instant> {
+        let millis = self
+            .fallback_lifetime_ms
+            .unwrap_or(settings.fallback_lifetime_ms);
+        if millis == -1 {
+            None
+        } else {
+            // Preserve the previous zero -> 1 ms behavior. Other negatives
+            // are not an unlimited-lifetime sentinel.
+            Some(now + Duration::from_millis(millis.max(1) as u64))
+        }
     }
 
     fn offset_forward(&self, settings: &AttackSummonSettings) -> f32 {
@@ -494,13 +581,19 @@ impl AttackSummonConfig {
 struct AttackSummonInstance {
     config_index: usize,
     requested_at: Instant,
-    expires_at: Instant,
+    expires_at: Option<Instant>,
     handle: Option<FieldInsHandle>,
     active: bool,
     pending_bind: bool,
     /// Set once the unit has been made inert and is waiting for real removal.
     /// The unit is always hidden for at least one tick before it is destroyed.
     destroy_at: Option<Instant>,
+}
+
+impl AttackSummonInstance {
+    fn removal_started(&self) -> bool {
+        self.destroy_at.is_some()
+    }
 }
 
 #[derive(Default)]
@@ -577,7 +670,7 @@ impl AttackSummonState {
                 if let Some(chr) = chr_by_handle_mut(world_chr_man, handle) {
                     activate_existing_summon(chr, position, player_yaw, config, settings);
                     self.summons[index].requested_at = now;
-                    self.summons[index].expires_at = now + config.fallback_lifetime(settings);
+                    self.summons[index].expires_at = config.expires_at(settings, now);
                     self.summons[index].active = true;
                     self.summons[index].pending_bind = false;
                     log_line(format_args!(
@@ -637,7 +730,7 @@ impl AttackSummonState {
         self.summons.push(AttackSummonInstance {
             config_index,
             requested_at: now,
-            expires_at: now + config.fallback_lifetime(settings),
+            expires_at: config.expires_at(settings, now),
             handle: None,
             active: true,
             pending_bind: true,
@@ -657,7 +750,9 @@ impl AttackSummonState {
         while index < self.summons.len() {
             let should_remove = {
                 let summon = &mut self.summons[index];
-                if !summon.active && !summon.pending_bind {
+                if summon.removal_started() {
+                    true
+                } else if !summon.active && !summon.pending_bind {
                     false
                 } else if summon.handle.is_none() {
                     now.duration_since(summon.requested_at) >= settings.unbound_timeout()
@@ -675,7 +770,7 @@ impl AttackSummonState {
                 // Stage the unit first: make it inert and release its event ids,
                 // then let at least one tick pass before the character is torn
                 // down, so no other system is mid-iteration over it.
-                let ready = if self.summons[index].destroy_at.is_none() {
+                if self.summons[index].destroy_at.is_none() {
                     let summon = &mut self.summons[index];
                     let handle_text = match summon.handle {
                         Some(handle) => handle.to_string(),
@@ -686,10 +781,8 @@ impl AttackSummonState {
                         None => (0, true),
                     };
                     release_summon(world_chr_man, summon);
-                    summon.destroy_at = Some(
-                        now.checked_add(settings.destroy_delay())
-                            .unwrap_or(now),
-                    );
+                    summon.destroy_at =
+                        Some(now.checked_add(settings.destroy_delay()).unwrap_or(now));
                     let config = settings.summons[summon.config_index];
                     log_line(format_args!(
                         "summon staged for removal: handle={handle_text} npc_param_id={} \
@@ -697,38 +790,10 @@ impl AttackSummonState {
                          entry_consistent={consistent}",
                         config.npc_param_id, config.event_entity_id
                     ));
-                    false
-                } else {
-                    self.summons[index]
-                        .destroy_at
-                        .is_some_and(|at| now >= at)
-                };
-
-                if ready {
-                    let summon = self.summons.swap_remove(index);
-                    if let Some(handle) = summon.handle {
-                        let config = settings.summons[summon.config_index];
-                        let outcome = destroy_summon(world_chr_man, handle);
-                        let (ids, capacity) = chr_set_usage(world_chr_man, handle);
-                        log_line(format_args!(
-                            "summon removed: handle={handle} npc_param_id={} \
-                             event_entity_id={} outcome={outcome} set_event_ids={ids} \
-                             set_capacity={capacity}",
-                            config.npc_param_id, config.event_entity_id
-                        ));
-                        match outcome {
-                            DestroyOutcome::NotFound | DestroyOutcome::EntryMismatch => {
-                                log_line(format_args!(
-                                    "summon removal warning: handle={handle} was not removed \
-                                     ({outcome}); the unit may still be resident"
-                                ));
-                            }
-                            DestroyOutcome::Destroyed | DestroyOutcome::EntryCleared => {}
-                        }
-                    }
-                } else {
-                    index += 1;
                 }
+
+                // Physical removal is exclusively owned by the FrameEnd task.
+                index += 1;
             } else if settings.reuses_units() && self.summons[index].handle.is_some() {
                 let summon = &mut self.summons[index];
                 park_summon(world_chr_man, summon, settings);
@@ -739,6 +804,32 @@ impl AttackSummonState {
                     release_summon_event_ids(world_chr_man, handle);
                 }
                 release_summon(world_chr_man, &summon);
+            }
+        }
+    }
+
+    fn finish_pending_destruction(&mut self, world: &mut WorldChrMan, now: Instant) {
+        let mut index = 0;
+        while index < self.summons.len() {
+            if !self.summons[index].destroy_at.is_some_and(|at| now >= at) {
+                index += 1;
+                continue;
+            }
+            let summon = self.summons[index];
+            let outcome = summon.handle.map(|handle| destroy_summon(world, handle));
+            if matches!(
+                outcome,
+                None | Some(DestroyOutcome::RetirementStarted) | Some(DestroyOutcome::NotFound)
+            ) {
+                self.summons.swap_remove(index);
+            } else {
+                log_line(format_args!(
+                    "summon retirement refused: outcome={}",
+                    outcome.unwrap()
+                ));
+                // Retry at a bounded rate; never discard an unresolved live instance.
+                self.summons[index].destroy_at = Some(now + Duration::from_secs(1));
+                index += 1;
             }
         }
     }
@@ -776,14 +867,13 @@ impl AttackSummonState {
         let chr_reports_id =
             character_reports_event_entity_id(world_chr_man, handle, config.event_entity_id)
                 .unwrap_or(false);
-        // End to end check: resolving the configured id has to lead back to this
-        // very unit, which is what event scripts do.
-        let id_leads_back = entity_id_owner(world_chr_man, handle, config.event_entity_id)
-            == Some(handle);
+        // Local map check only. The actual EMEVD consumer must be tested separately.
+        let id_leads_back =
+            entity_id_owner(world_chr_man, handle, config.event_entity_id) == Some(handle);
         let (ids, capacity) = chr_set_usage(world_chr_man, handle);
         log_line(format_args!(
             "summon bound: handle={handle} npc_param_id={} configured_event_entity_id={} \
-             chr_reports_id={chr_reports_id} id_resolves_to_this_unit={id_leads_back} \
+             chr_reports_id={chr_reports_id} local_set_id_resolves_to_this_unit={id_leads_back} \
              entity_id_outcome={outcome} set_event_ids={ids} set_capacity={capacity}",
             config.npc_param_id, config.event_entity_id,
         ));
@@ -815,26 +905,21 @@ impl AttackSummonState {
     /// engine has already torn the set down the handle stops resolving, so
     /// nothing is freed and the outcome says so.
     fn release_all(&mut self, world_chr_man: &mut WorldChrMan, settings: &AttackSummonSettings) {
-        for summon in &self.summons {
-            let config = settings.summons[summon.config_index];
+        for summon in &mut self.summons {
+            if summon.destroy_at.is_some() {
+                continue;
+            }
             if let Some(handle) = summon.handle {
                 release_summon_event_ids(world_chr_man, handle);
             }
             release_summon(world_chr_man, summon);
-            if settings.remove_mode == RemoveMode::Destroy
-                && let Some(handle) = summon.handle
-            {
-                let outcome = destroy_summon(world_chr_man, handle);
-                let (ids, capacity) = chr_set_usage(world_chr_man, handle);
-                log_line(format_args!(
-                    "summon removed (reset): handle={handle} npc_param_id={} \
-                     event_entity_id={} outcome={outcome} set_event_ids={ids} \
-                     set_capacity={capacity}",
-                    config.npc_param_id, config.event_entity_id
-                ));
+            if settings.remove_mode == RemoveMode::Destroy {
+                summon.destroy_at = Some(Instant::now() + settings.destroy_delay());
             }
         }
-        self.summons.clear();
+        if settings.remove_mode != RemoveMode::Destroy {
+            self.summons.clear();
+        }
     }
 }
 
@@ -898,7 +983,7 @@ fn summon_should_disappear(
     now: Instant,
     settings: &AttackSummonSettings,
 ) -> bool {
-    if now >= summon.expires_at {
+    if summon.expires_at.is_some_and(|deadline| now >= deadline) {
         return true;
     }
     let config = settings.summons[summon.config_index];
@@ -910,8 +995,7 @@ fn summon_should_disappear(
         return true;
     };
 
-    if chr_dead_or_disabled(chr) || chr_has_speffect(chr, config.vanish_request_speffect(settings))
-    {
+    if chr_dead(chr) || chr_has_speffect(chr, config.vanish_request_speffect(settings)) {
         return true;
     }
 
@@ -1084,9 +1168,9 @@ fn release_summon(world_chr_man: &mut WorldChrMan, summon: &AttackSummonInstance
     chr.tint_alpha_multiplier_modifier = 0.0;
 }
 
-fn chr_dead_or_disabled(chr: &ChrIns) -> bool {
+fn chr_dead(chr: &ChrIns) -> bool {
     let data = chr.modules.as_ref().data.as_ref();
-    data.hp <= 0 || chr.chr_flags1c5.death_flag() || chr.debug_flags.character_disabled()
+    data.hp <= 0 || chr.chr_flags1c5.death_flag()
 }
 
 fn chr_has_speffect(chr: &ChrIns, sp_effect: i32) -> bool {
@@ -1133,7 +1217,7 @@ fn default_unbound_timeout_ms() -> u64 {
     2000
 }
 
-fn default_fallback_lifetime_ms() -> u64 {
+fn default_fallback_lifetime_ms() -> i64 {
     10_000
 }
 
@@ -1305,6 +1389,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unlimited_lifetime_and_entry_overrides() {
+        let settings: AttackSummonSettings = toml::from_str(
+            r#"
+fallback_lifetime_ms = -1
+[[summons]]
+trigger_speffect = 1
+npc_param_id = 2
+animation_id = 3
+[[summons]]
+trigger_speffect = 2
+npc_param_id = 2
+animation_id = 3
+fallback_lifetime_ms = 10000
+"#,
+        )
+        .unwrap();
+        let now = Instant::now();
+        assert_eq!(settings.summons[0].expires_at(&settings, now), None);
+        assert_eq!(
+            settings.summons[1].expires_at(&settings, now),
+            Some(now + Duration::from_secs(10))
+        );
+        let mut finite = settings.clone();
+        finite.fallback_lifetime_ms = 10000;
+        finite.summons[0].fallback_lifetime_ms = Some(-1);
+        assert_eq!(finite.summons[0].expires_at(&finite, now), None);
+        finite.summons[0].fallback_lifetime_ms = Some(0);
+        assert_eq!(
+            finite.summons[0].expires_at(&finite, now),
+            Some(now + Duration::from_millis(1))
+        );
+        assert_eq!(AttackSummonSettings::default().fallback_lifetime_ms, 10000);
+    }
+
+    #[test]
+    fn unlimited_staged_removal_survives_cleared_trigger_and_inactive_state() {
+        let now = Instant::now();
+        let summon = AttackSummonInstance {
+            config_index: 0,
+            requested_at: now,
+            expires_at: None,
+            handle: None,
+            active: false,
+            pending_bind: false,
+            destroy_at: Some(now + Duration::from_millis(100)),
+        };
+        assert!(summon.removal_started());
+        assert!(!summon.destroy_at.is_some_and(|at| now >= at));
+        assert!(
+            summon
+                .destroy_at
+                .is_some_and(|at| now + Duration::from_millis(100) >= at)
+        );
+    }
+
+    #[test]
     fn supports_only_the_pinned_fsrs_game_versions() {
         assert!(SupportedErVersion::from_lang_version(LANG_ID_EN, "2.7.1.0").is_some());
         assert!(SupportedErVersion::from_lang_version(LANG_ID_JP, "2.7.1.1").is_none());
@@ -1332,7 +1472,7 @@ mod tests {
     ///
     /// Each value below comes from disassembling WW 2.7.1.0, so the assertions
     /// fail loudly if a future binding revision moves a field the removal path
-    /// depends on. See `docs/compatibility/engine-chr-lifecycle.md`.
+    /// depends on. Native byte fixtures are retained under `tests/fixtures/`.
     #[test]
     fn pinned_chr_lifecycle_offsets_match_disassembly() {
         use eldenring::cs::{ChrSet, ChrSetEntry, PlayerIns};

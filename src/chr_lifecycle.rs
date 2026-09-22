@@ -1,8 +1,8 @@
 //! Verified engine-level character lifecycle operations.
 //!
 //! Everything here is grounded in disassembly of the supported executables rather
-//! than in field-name guesses. Evidence table:
-//! `docs/compatibility/engine-chr-lifecycle.md`.
+//! than in field-name guesses. Native byte fixtures are retained under
+//! `tests/fixtures/` for the verified paths.
 //!
 //! Verified against WW 2.7.1.0 (image base 0x140000000):
 //!
@@ -45,12 +45,15 @@
 //!    reported but not required: a character that has not been registered yet
 //!    stores a null there.
 
+use eldenring::dlkr::DLAllocator;
 use std::fmt;
 use std::ptr::NonNull;
+use windows::Win32::System::Memory::{
+    MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualQuery,
+};
 
 use eldenring::cs::{
-    BlockId, ChrIns, ChrLoadStatus, ChrSet, ChrSetEntry, ChrUpdateType, FieldInsHandle,
-    FieldInsSelector, WorldChrMan,
+    BlockId, ChrIns, ChrSet, ChrSetEntry, FieldInsHandle, FieldInsSelector, WorldChrMan,
 };
 
 /// Reported outcome of an entity id registration attempt.
@@ -92,10 +95,11 @@ impl fmt::Display for EntityIdOutcome {
 /// Reported outcome of a real removal attempt.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DestroyOutcome {
-    /// The character was destroyed and its character set entry cleared.
-    Destroyed,
-    /// The handle no longer resolves, but a leftover entry was cleared.
-    EntryCleared,
+    /// Detached and queued; not yet freed.
+    RetirementStarted,
+    /// Native allocator-owner lookup could not be verified; leave the unit inert.
+    AllocatorUnavailable,
+
     /// The handle and the character disagree about the owning entry, so nothing
     /// was freed.
     EntryMismatch,
@@ -106,8 +110,8 @@ pub(crate) enum DestroyOutcome {
 impl DestroyOutcome {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::Destroyed => "destroyed",
-            Self::EntryCleared => "entry-cleared",
+            Self::RetirementStarted => "retirement-started",
+            Self::AllocatorUnavailable => "allocator-unavailable",
             Self::EntryMismatch => "entry-mismatch",
             Self::NotFound => "not-found",
         }
@@ -130,7 +134,10 @@ fn chr_set_for_handle(
 }
 
 /// Entry the handle's own index points at.
-fn entry_from_index(chr_set: &ChrSet<ChrIns>, handle: FieldInsHandle) -> Option<NonNull<ChrSetEntry<ChrIns>>> {
+fn entry_from_index(
+    chr_set: &ChrSet<ChrIns>,
+    handle: FieldInsHandle,
+) -> Option<NonNull<ChrSetEntry<ChrIns>>> {
     let index = handle.selector.index() as usize;
     if index >= chr_set.capacity as usize {
         return None;
@@ -222,15 +229,17 @@ pub(crate) fn register_event_entity_id(
     };
     let key = event_entity_id as u32;
 
+    let mut already_registered = false;
     {
         let Some(chr_set) = chr_set_for_handle(world_chr_man, handle) else {
             return EntityIdOutcome::Unavailable;
         };
         if let Some(existing) = chr_set.entity_id_mapping.find(&key).copied() {
             if existing == entry {
-                return EntityIdOutcome::AlreadyRegisteredByEngine;
+                already_registered = true;
+            } else {
+                return EntityIdOutcome::Conflict;
             }
-            return EntityIdOutcome::Conflict;
         }
     }
 
@@ -244,8 +253,51 @@ pub(crate) fn register_event_entity_id(
     let Some(chr_set) = chr_set_for_handle(world_chr_man, handle) else {
         return EntityIdOutcome::Unavailable;
     };
-    chr_set.entity_id_mapping.insert(key, entry);
-    EntityIdOutcome::RegisteredByDll
+    if !already_registered {
+        chr_set.entity_id_mapping.insert(key, entry);
+    }
+    // Native registration also builds the group map and notifies the event
+    // manager. A round-trip through entity_id_mapping alone is not an EMEVD test.
+    let group_before = chr_set.group_id_mapping.iter()
+        .filter(|p| p.first == key && p.second == entry).count();
+    let character = unsafe { entry.as_ref() }.chr_ins;
+    let mut native_called = false;
+    if group_before == 0 {
+        if let (Some(register), Some(character)) = (native_event_groups(chr_set), character) {
+            unsafe { register(chr_set, character.as_ptr(), entry.as_ptr()); }
+            native_called = true;
+        }
+    }
+    let group_after = chr_set.group_id_mapping.iter()
+        .filter(|p| p.first == key && p.second == entry).count();
+    crate::log_line(format_args!(
+        "summon event registration: handle={handle} entity_id={key} native_groups_called={native_called} group_before={group_before} group_after={group_after} emevd_lookup=unverified"
+    ));
+    if already_registered { EntityIdOutcome::AlreadyRegisteredByEngine }
+    else { EntityIdOutcome::RegisteredByDll }
+}
+
+type RegisterEventGroups = unsafe extern "C" fn(*mut ChrSet<ChrIns>, *mut ChrIns, *mut ChrSetEntry<ChrIns>) -> u8;
+
+fn event_groups_code_matches(code: &[u8]) -> bool {
+    code == include_bytes!("../tests/fixtures/ww271-register-event-groups.bin")
+}
+
+fn native_event_groups(set: &ChrSet<ChrIns>) -> Option<RegisterEventGroups> {
+    // Exact-image candidate: verify both the known free routine and the complete
+    // group registration body before using this RVA. Never call on a near match.
+    let vtable = unsafe { *(set as *const _ as *const *const usize) };
+    let free = unsafe { *vtable.add(8) };
+    let region = executable_region(free, 0x100)?;
+    let base = region.AllocationBase as usize;
+    if free.checked_sub(base)? != 0x495890 { return None; }
+    let free_code = unsafe { std::slice::from_raw_parts(free as *const u8, 0x100) };
+    if free_code != include_bytes!("../tests/fixtures/ww271-chrset-free-prefix.bin") { return None; }
+    let address = base.checked_add(0x494800)?;
+    if executable_region(address, 0x198)?.AllocationBase != region.AllocationBase { return None; }
+    let code = unsafe { std::slice::from_raw_parts(address as *const u8, 0x198) };
+    if !event_groups_code_matches(code) { return None; }
+    Some(unsafe { std::mem::transmute::<usize, RegisterEventGroups>(address) })
 }
 
 /// Whether the character behind `handle` still reports `event_entity_id`.
@@ -313,7 +365,10 @@ pub(crate) fn entity_id_owner(
 }
 
 /// Number of registered event ids and the capacity of the character set holding `handle`.
-pub(crate) fn chr_set_usage(world_chr_man: &mut WorldChrMan, handle: FieldInsHandle) -> (usize, u32) {
+pub(crate) fn chr_set_usage(
+    world_chr_man: &mut WorldChrMan,
+    handle: FieldInsHandle,
+) -> (usize, u32) {
     let Some(chr_set) = chr_set_for_handle(world_chr_man, handle) else {
         return (0, 0);
     };
@@ -347,50 +402,18 @@ fn clear_debug_creator_pointer(world_chr_man: &mut WorldChrMan, chr: *const ChrI
     }
 }
 
-/// Clears the owning `ChrSet` entry so the slot stops referencing the character.
-fn clear_chr_set_entry(entry: NonNull<ChrSetEntry<ChrIns>>) {
-    let entry = entry.as_ptr();
-    unsafe {
-        (*entry).chr_ins = None;
-        (*entry).chr_load_status = ChrLoadStatus::Unloaded;
-        (*entry).chr_update_type = ChrUpdateType::Local;
-        (*entry).entry_flags = 0;
-    }
-}
-
-/// Really removes a summon from game memory.
-///
-/// Order:
-///
-/// 1. drop every event id mapping that still points at the unit, so event scripts
-///    can no longer resolve it,
-/// 2. drop the player's lock-on if it still targets the unit,
-/// 3. clear the character creator's reference to the unit,
-/// 4. run the engine destructor through the character vtable with the delete flag,
-///    which tears the character down and frees its 0x580 byte allocation,
-/// 5. clear the owning `ChrSet` entry so the slot no longer aliases freed memory.
-///
-/// The caller must have made the character inert beforehand; see the staged
-/// removal path in the main module.
-pub(crate) fn destroy_summon(world_chr_man: &mut WorldChrMan, handle: FieldInsHandle) -> DestroyOutcome {
+/// Starts native detachment, exclusively from FrameEnd. No storage is freed
+/// here: the retirement queue waits for native readers and task proxies to drain.
+/// Ownership transfers to that queue after native detach succeeds.
+pub(crate) fn destroy_summon(
+    world_chr_man: &mut WorldChrMan,
+    handle: FieldInsHandle,
+) -> DestroyOutcome {
     let entry = match lookup_entry(world_chr_man, handle) {
         EntryLookup::Resolved(resolved) => resolved.entry,
         EntryLookup::Mismatch => return DestroyOutcome::EntryMismatch,
-        EntryLookup::Unavailable => {
-            // The handle no longer resolves. If a slot is still reachable it is a
-            // leftover, so clear it rather than leave it aliasing freed memory.
-            let Some(chr_set) = chr_set_for_handle(world_chr_man, handle) else {
-                return DestroyOutcome::NotFound;
-            };
-            let Some(entry) = entry_from_index(chr_set, handle) else {
-                return DestroyOutcome::NotFound;
-            };
-            if unsafe { entry.as_ref().chr_ins }.is_none() {
-                return DestroyOutcome::NotFound;
-            }
-            clear_chr_set_entry(entry);
-            return DestroyOutcome::EntryCleared;
-        }
+        // An unresolved handle is not proof that its index still belongs to us.
+        EntryLookup::Unavailable => return DestroyOutcome::NotFound,
     };
 
     // Resolved means the engine hands this character out for this handle, so the
@@ -402,27 +425,62 @@ pub(crate) fn destroy_summon(world_chr_man: &mut WorldChrMan, handle: FieldInsHa
         return DestroyOutcome::NotFound;
     };
 
-    // The mapping sweep has to run while the character is still reachable, since
-    // it is the character that tells us which entry the ids belong to.
+    // Resolve ownership BEFORE destruction, exactly as ChrSet::free_chr_list does.
+    // The deleting destructor uses CRT delete, which is not valid for every
+    // character allocator (see the 2026-09-23 heap-corruption dump).
+    let Some(owner_lookup) = native_owner_lookup(world_chr_man, handle) else {
+        return DestroyOutcome::AllocatorUnavailable;
+    };
+    let Some(owner) = NonNull::new(unsafe { owner_lookup(chr_ptr.cast()) }) else {
+        return DestroyOutcome::AllocatorUnavailable;
+    };
+
+    let Some(detach) = native_detach(world_chr_man, handle) else {
+        return DestroyOutcome::AllocatorUnavailable;
+    };
+    let Some(task_cleanup) = verified_task_cleanup(chr_ptr as usize) else {
+        return DestroyOutcome::AllocatorUnavailable;
+    };
+    let destructor = unsafe { (&*chr_ptr).vftable.destructor } as usize;
+    let world_address = world_chr_man as *mut _ as usize;
+    let player = crate::retirement::player_address(world_chr_man);
+    if player == 0 {
+        return DestroyOutcome::AllocatorUnavailable;
+    }
     release_event_ids_for_handle(world_chr_man, handle);
     clear_player_lock_on(world_chr_man, handle);
     clear_debug_creator_pointer(world_chr_man, chr_ptr.cast_const());
 
-    // Slot 1 of the ChrIns vtable is the engine destructor. The delete flag makes
-    // it call operator delete with the verified 0x580 byte size; the exe links its
-    // CRT statically and that free ends in HeapFree on the CRT heap, which is the
-    // same memory `ChrSet::free_chr_list` releases.
-    //
-    // The reference taken here is explicit on purpose: reaching the vtable through
-    // an implicit autoref of the raw pointer deref is what edition 2024 denies.
-    let destructor = {
-        let chr = unsafe { &*chr_ptr };
-        chr.vftable.destructor
-    };
-    unsafe { destructor(&mut *chr_ptr, 1) };
-
-    clear_chr_set_entry(entry);
-    DestroyOutcome::Destroyed
+    // Native free_task nulls the proxy's subject and queues its unregistration.
+    // Do this while the character and all modules are still alive.
+    for offset in crate::retirement::TASK_OFFSETS {
+        unsafe { task_cleanup((chr_ptr as usize + offset) as *mut u8) };
+    }
+    let set = chr_set_for_handle(world_chr_man, handle).expect("validated set");
+    let detached = unsafe { detach(set, handle.selector.index()) };
+    if detached != chr_ptr {
+        crate::log_line(format_args!(
+            "summon retirement warning: native detach returned unexpected pointer for {handle}; no free attempted"
+        ));
+        return DestroyOutcome::EntryMismatch;
+    }
+    // Native detach cleared the entry and id/group mappings. Do not write the
+    // slot again, especially after it can be reused by a subsequent summon.
+    let _ = entry;
+    crate::retirement::enqueue(crate::retirement::Retired {
+        world: world_address,
+        player,
+        character: chr_ptr as usize,
+        owner: owner.as_ptr() as usize,
+        destructor,
+        handle,
+        gate: Default::default(),
+        last_observation: None,
+    });
+    crate::log_line(format_args!(
+        "summon retirement: handle={handle} phase=detached character={chr_ptr:p} tasks_unregistered=6"
+    ));
+    DestroyOutcome::RetirementStarted
 }
 
 /// Releases every event id of a summon that is on its way out.
@@ -438,5 +496,208 @@ pub(crate) fn release_summon_event_ids(
         EntryLookup::Mismatch => false,
         EntryLookup::Unavailable => return (0, false),
     };
-    (release_event_ids_for_handle(world_chr_man, handle), consistent)
+    (
+        release_event_ids_for_handle(world_chr_man, handle),
+        consistent,
+    )
+}
+
+// Resolve the same owner lookup called by this character set's native cleanup.
+// The exact instruction context includes destructor(flag=0) and deallocate(+0x68).
+// Unknown or patched code fails closed; no guessed RVA or CRT allocator fallback.
+const OWNER_CALL_PREFIX: &[u8] = &[0x48, 0x8b, 0xc8, 0xe8];
+const OWNER_CALL_SUFFIX: &[u8] = &[
+    0x4d, 0x8b, 0x06, 0x33, 0xd2, 0x49, 0x8b, 0xce, 0x48, 0x8b, 0xf8, 0x41, 0xff, 0x50, 0x08, 0x4c,
+    0x8b, 0x07, 0x49, 0x8b, 0xd6, 0x48, 0x8b, 0xcf, 0x41, 0xff, 0x50, 0x68,
+];
+
+type OwnerLookup = unsafe extern "C" fn(*const u8) -> *mut DLAllocator;
+
+fn owner_lookup_address(code: &[u8], base: usize) -> Option<usize> {
+    let mut found = None;
+    for (offset, window) in code.windows(8 + OWNER_CALL_SUFFIX.len()).enumerate() {
+        if window.starts_with(OWNER_CALL_PREFIX) && &window[8..] == OWNER_CALL_SUFFIX {
+            if found.is_some() {
+                return None;
+            }
+            let delta = i32::from_le_bytes(window[4..8].try_into().ok()?);
+            found = Some(
+                base.checked_add(offset + 8)?
+                    .checked_add_signed(delta as isize)?,
+            );
+        }
+    }
+    found
+}
+
+fn executable_region(address: usize, size: usize) -> Option<MEMORY_BASIC_INFORMATION> {
+    let mut region = MEMORY_BASIC_INFORMATION::default();
+    if unsafe {
+        VirtualQuery(
+            Some(address as *const _),
+            &mut region,
+            std::mem::size_of_val(&region),
+        )
+    } == 0
+        || region.State != MEM_COMMIT
+        || region.Protect.0 & 0xf0 == 0
+        || region.Protect.0 & PAGE_GUARD.0 != 0
+        || address.checked_add(size)?
+            > (region.BaseAddress as usize).checked_add(region.RegionSize)?
+    {
+        return None;
+    }
+    Some(region)
+}
+
+fn native_owner_lookup(world: &mut WorldChrMan, handle: FieldInsHandle) -> Option<OwnerLookup> {
+    let set = chr_set_for_handle(world, handle)?;
+    // ChrSet vtable slot 8 is free_chr_list; the binding keeps this vtable private.
+    let vtable = unsafe { *(set as *const ChrSet<ChrIns> as *const *const usize) };
+    let native_free = unsafe { *vtable.add(8) };
+    let region = executable_region(native_free, 0x100)?;
+    let code = unsafe { std::slice::from_raw_parts(native_free as *const u8, 0x100) };
+    let address = owner_lookup_address(code, native_free)?;
+    let target_region = executable_region(address, 1)?;
+    if target_region.AllocationBase != region.AllocationBase {
+        return None;
+    }
+    Some(unsafe { std::mem::transmute::<usize, OwnerLookup>(address) })
+}
+
+// Shared by production teardown and the allocator protocol regression test.
+pub(crate) fn teardown_with_owner(destruct: impl FnOnce(bool), deallocate: impl FnOnce()) {
+    destruct(false);
+    deallocate();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn event_groups_binding_rejects_modified_or_truncated_native_body() {
+        let code = include_bytes!("../tests/fixtures/ww271-register-event-groups.bin");
+        assert!(event_groups_code_matches(code));
+        assert!(!event_groups_code_matches(&code[..code.len()-1]));
+        let mut modified = *code;
+        modified[0x15e] ^= 1; // event-manager notification call must stay intact
+        assert!(!event_groups_code_matches(&modified));
+    }
+
+    #[test]
+    fn native_owner_lookup_matches_shipped_ww271_code_and_rejects_changes() {
+        let code = include_bytes!("../tests/fixtures/ww271-chrset-free-prefix.bin");
+        // Fixture is from the verified WW 2.7.1.0 executable, RVA 0x495890.
+        assert_eq!(owner_lookup_address(code, 0x495890), Some(0xe1c080));
+        let mut modified = *code;
+        modified[0x65] ^= 1; // change xor edx,edx: destructor no longer verified
+        assert_eq!(owner_lookup_address(&modified, 0x495890), None);
+        let duplicate = [code.as_slice(), code.as_slice()].concat();
+        assert_eq!(owner_lookup_address(&duplicate, 0x495890), None);
+        assert_eq!(owner_lookup_address(&code[..0x70], 0x495890), None);
+    }
+
+    #[test]
+    fn teardown_does_not_crt_delete_an_allocator_owned_character() {
+        let calls = RefCell::new(Vec::new());
+        teardown_with_owner(
+            |delete| {
+                assert!(
+                    !delete,
+                    "CRT delete on an owner-allocated character causes heap corruption"
+                );
+                calls.borrow_mut().push("destruct");
+            },
+            || calls.borrow_mut().push("owner-deallocate"),
+        );
+        assert_eq!(*calls.borrow(), ["destruct", "owner-deallocate"]);
+    }
+}
+
+type Detach = unsafe extern "C" fn(*mut ChrSet<ChrIns>, u32) -> *mut ChrIns;
+type TaskCleanup = unsafe extern "C" fn(*mut u8);
+const DETACH_PREFIX: &[u8] = &[0x8b, 0xd6, 0x48, 0x8b, 0xcb, 0xe8];
+const DETACH_SUFFIX: &[u8] = &[0x4c, 0x8b, 0xf0, 0x48, 0x85, 0xc0, 0x74];
+fn detach_address(code: &[u8], base: usize) -> Option<usize> {
+    let mut found = None;
+    for (i, w) in code.windows(10 + DETACH_SUFFIX.len()).enumerate() {
+        if w.starts_with(DETACH_PREFIX) && &w[10..] == DETACH_SUFFIX {
+            if found.is_some() {
+                return None;
+            }
+            let delta = i32::from_le_bytes(w[6..10].try_into().ok()?);
+            found = Some(
+                base.checked_add(i + 10)?
+                    .checked_add_signed(delta as isize)?,
+            );
+        }
+    }
+    found
+}
+fn native_detach(world: &mut WorldChrMan, handle: FieldInsHandle) -> Option<Detach> {
+    let set = chr_set_for_handle(world, handle)?;
+    let vtable = unsafe { *(set as *const _ as *const *const usize) };
+    let native_free = unsafe { *vtable.add(8) };
+    let region = executable_region(native_free, 0x100)?;
+    let code = unsafe { std::slice::from_raw_parts(native_free as *const u8, 0x100) };
+    let target = detach_address(code, native_free)?;
+    if executable_region(target, 1)?.AllocationBase != region.AllocationBase {
+        return None;
+    }
+    Some(unsafe { std::mem::transmute::<usize, Detach>(target) })
+}
+fn verified_task_cleanup(character: usize) -> Option<TaskCleanup> {
+    let mut common = None;
+    for offset in crate::retirement::TASK_OFFSETS {
+        let vtable = unsafe { *((character + offset) as *const *const usize) };
+        let function = unsafe { *vtable.add(5) };
+        executable_region(function, 0x25)?;
+        let code = unsafe { std::slice::from_raw_parts(function as *const u8, 0x25) };
+        // Exact verified body except the rel32 call displacement. Different
+        // builds are refused rather than executing a vaguely similar function.
+        if !task_cleanup_matches(code) {
+            return None;
+        }
+        let delta = i32::from_le_bytes(code[0x13..0x17].try_into().ok()?);
+        let unregister = function
+            .checked_add(0x17)?
+            .checked_add_signed(delta as isize)?;
+        if executable_region(unregister, 1)?.AllocationBase
+            != executable_region(function, 1)?.AllocationBase
+        {
+            return None;
+        }
+        if common.is_some_and(|previous| previous != function) {
+            return None;
+        }
+        common = Some(function);
+    }
+    Some(unsafe { std::mem::transmute::<usize, TaskCleanup>(common?) })
+}
+
+fn task_cleanup_matches(code: &[u8]) -> bool {
+    let expected = include_bytes!("../tests/fixtures/ww271-task-free.bin");
+    code.len() == expected.len()
+        && code[..0x13] == expected[..0x13]
+        && code[0x17..] == expected[0x17..]
+}
+
+#[cfg(test)]
+mod retirement_binding_tests {
+    use super::*;
+    #[test]
+    fn native_detach_and_task_free_are_verified_before_mutation() {
+        let code = include_bytes!("../tests/fixtures/ww271-chrset-free-prefix.bin");
+        assert_eq!(detach_address(code, 0x495890), Some(0x494f10));
+        let mut bad = *code;
+        bad[0x46] ^= 1;
+        assert_eq!(detach_address(&bad, 0x495890), None);
+        let tasks = include_bytes!("../tests/fixtures/ww271-task-free.bin");
+        assert!(task_cleanup_matches(tasks));
+        let mut bad_task = *tasks;
+        bad_task[0x1a] ^= 1;
+        assert!(!task_cleanup_matches(&bad_task));
+    }
 }
