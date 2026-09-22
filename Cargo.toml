@@ -32,8 +32,11 @@ name = "summon"
 crate-type = ["cdylib"]
 
 [profile.release]
-strip = true
-lto = true
-codegen-units = 1
-panic = "abort"
-opt-level = "z"
+# Keep the release artifact in the same shape as an ordinary development
+# build: debug info present, symbols intact. A stripped, size-minimized
+# cdylib that lives inside another process and rewrites its memory matches
+# the heuristic profile of a packed payload, and endpoint security agents
+# flag it intermittently. Keeping the symbols also makes crash triage
+# possible, which a stripped build cannot offer.
+debug = 2
+strip = "none"
