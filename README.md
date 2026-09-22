@@ -171,6 +171,10 @@ for the differential evidence against the sibling mod DLLs that are never
 flagged, the hypotheses that were measured and excluded, and what has to
 happen outside this repository before the artifact is actually trusted.
 
+[docs/handover.md](docs/handover.md) summarises the 2026-09-22 changes as a
+whole: the event entity id work, the real removal path, and the artifact-shape
+changes above, together with what is still unverified.
+
 ## License
 
 Licensed under either Apache License 2.0 or MIT, at your option. The `eldenring`
