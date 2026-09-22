@@ -1,6 +1,9 @@
+mod chr_lifecycle;
+
 use std::{
     ffi::{OsString, c_void},
     fs,
+    io::Write,
     os::windows::ffi::OsStringExt,
     path::{Path, PathBuf},
     sync::{
@@ -9,6 +12,11 @@ use std::{
     },
     thread,
     time::{Duration, Instant},
+};
+
+use chr_lifecycle::{
+    DestroyOutcome, EntityIdOutcome, character_reports_event_entity_id, chr_set_usage, destroy_summon,
+    entity_id_owner, register_event_entity_id, release_summon_event_ids,
 };
 
 use eldenring::{
@@ -32,6 +40,7 @@ use windows::Win32::{
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 const CONFIG_FILE_NAME: &str = "summon.toml";
+const LOG_FILE_NAME: &str = "summon.log";
 const DEBUG_CREATOR_INIT_DATA_SIZE: usize = 0x100;
 const DEBUG_CREATOR_SPAWN_ROTATION_OFFSET: usize = 0x10;
 const DEBUG_CREATOR_ENEMY_TYPE_OFFSET: usize = 0xc8;
@@ -39,8 +48,38 @@ const DEBUG_CREATOR_ENEMY_TYPE_OFFSET: usize = 0xc8;
 static INSTALL_TASKS: Once = Once::new();
 static DLL_MODULE: AtomicIsize = AtomicIsize::new(0);
 static SETTINGS: OnceLock<AttackSummonSettings> = OnceLock::new();
+static LOG: LazyLock<Mutex<Option<fs::File>>> = LazyLock::new(|| Mutex::new(None));
 static STATE: LazyLock<Mutex<AttackSummonState>> =
     LazyLock::new(|| Mutex::new(AttackSummonState::default()));
+
+/// Appends a line to `summon.log` next to the DLL.
+///
+/// Logging exists so the lifecycle claims shipped with this mod are verifiable in
+/// a live session without a debugger: every bind reports the entity id the engine
+/// and this DLL settled on, and every removal reports whether the character set
+/// entry was actually released.
+pub(crate) fn log_line(message: impl std::fmt::Display) {
+    if !settings().log_enabled {
+        return;
+    }
+    let Ok(mut guard) = LOG.lock() else {
+        return;
+    };
+    if guard.is_none() {
+        let Some(path) = module_dir().map(|dir| dir.join(LOG_FILE_NAME)) else {
+            return;
+        };
+        *guard = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok();
+    }
+    if let Some(file) = guard.as_mut() {
+        let _ = writeln!(file, "{message}");
+        let _ = file.flush();
+    }
+}
 
 #[unsafe(no_mangle)]
 /// # Safety
@@ -99,6 +138,17 @@ fn install_tasks_once() {
             CSTaskGroupIndex::ChrIns_PostPhysics,
         );
         std::mem::forget(attack_summon);
+
+        let settings = settings();
+        log_line(format_args!(
+            "summon initialised: remove_mode={:?} register_event_entity_id={} \
+             effective_reuse={} destroy_delay_ms={} summons={}",
+            settings.remove_mode,
+            settings.register_event_entity_id,
+            settings.reuses_units(),
+            settings.destroy_delay_ms,
+            settings.summons.len(),
+        ));
     });
 }
 
@@ -121,7 +171,7 @@ fn attack_summon_task(_: &FD4TaskData) {
 
     let Some((player_pos, player_yaw, triggers)) = consume_player_triggers(world_chr_man, settings)
     else {
-        state.release_all(world_chr_man);
+        state.release_all(world_chr_man, settings);
         return;
     };
     if triggers.is_empty() {
@@ -213,6 +263,18 @@ fn normalize_horizontal(vector: (f32, f32, f32), fallback: (f32, f32, f32)) -> (
     (vector.0 / len, 0.0, vector.2 / len)
 }
 
+/// What happens to a summon that has to disappear.
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+enum RemoveMode {
+    /// Only field writes: the unit stops rendering and updating but stays resident.
+    Hide,
+    /// Real removal: the event id is released, the engine destructor runs and the
+    /// character set entry is cleared, so nothing of the unit is left in memory.
+    #[default]
+    Destroy,
+}
+
 #[derive(Clone, Deserialize)]
 struct AttackSummonSettings {
     #[serde(default = "default_marker_speffect")]
@@ -243,6 +305,14 @@ struct AttackSummonSettings {
     reuse_spawned_units: bool,
     #[serde(default = "default_disable_lock_on")]
     disable_lock_on: bool,
+    #[serde(default)]
+    remove_mode: RemoveMode,
+    #[serde(default = "default_destroy_delay_ms")]
+    destroy_delay_ms: u64,
+    #[serde(default = "default_register_event_entity_id")]
+    register_event_entity_id: bool,
+    #[serde(default = "default_log_enabled")]
+    log_enabled: bool,
     #[serde(default = "default_summons")]
     summons: Vec<AttackSummonConfig>,
 }
@@ -264,6 +334,10 @@ impl Default for AttackSummonSettings {
             any_trigger_cooldown_ms: default_any_trigger_cooldown_ms(),
             reuse_spawned_units: default_reuse_spawned_units(),
             disable_lock_on: default_disable_lock_on(),
+            remove_mode: RemoveMode::default(),
+            destroy_delay_ms: default_destroy_delay_ms(),
+            register_event_entity_id: default_register_event_entity_id(),
+            log_enabled: default_log_enabled(),
             summons: default_summons(),
         }
     }
@@ -284,6 +358,17 @@ impl AttackSummonSettings {
 
     fn any_trigger_cooldown(&self) -> Duration {
         Duration::from_millis(self.any_trigger_cooldown_ms)
+    }
+
+    fn destroy_delay(&self) -> Duration {
+        Duration::from_millis(self.destroy_delay_ms)
+    }
+
+    /// Unit reuse and real removal are mutually exclusive: a destroyed character
+    /// cannot be reactivated, so `reuse_spawned_units` is ignored while
+    /// `remove_mode = "destroy"`.
+    fn reuses_units(&self) -> bool {
+        self.reuse_spawned_units && self.remove_mode == RemoveMode::Hide
     }
 }
 
@@ -413,6 +498,9 @@ struct AttackSummonInstance {
     handle: Option<FieldInsHandle>,
     active: bool,
     pending_bind: bool,
+    /// Set once the unit has been made inert and is waiting for real removal.
+    /// The unit is always hidden for at least one tick before it is destroyed.
+    destroy_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -473,25 +561,31 @@ impl AttackSummonState {
         let config = settings.summons[config_index];
         let position = summon_position(player_pos, forward, right, config, settings);
 
-        if settings.reuse_spawned_units {
-            if let Some(index) = self
+        if settings.reuses_units()
+            && let Some(index) = self
                 .summons
                 .iter()
                 .position(|summon| summon.config_index == config_index)
-            {
-                if self.summons[index].active || self.summons[index].pending_bind {
+        {
+            if self.summons[index].active || self.summons[index].pending_bind {
+                return;
+            }
+            if self.summons[index].destroy_at.is_some() {
+                // Staged for real removal; never bring it back.
+                self.summons.swap_remove(index);
+            } else if let Some(handle) = self.summons[index].handle {
+                if let Some(chr) = chr_by_handle_mut(world_chr_man, handle) {
+                    activate_existing_summon(chr, position, player_yaw, config, settings);
+                    self.summons[index].requested_at = now;
+                    self.summons[index].expires_at = now + config.fallback_lifetime(settings);
+                    self.summons[index].active = true;
+                    self.summons[index].pending_bind = false;
+                    log_line(format_args!(
+                        "summon reactivated: handle={handle} npc_param_id={} \
+                         event_entity_id={}",
+                        config.npc_param_id, config.event_entity_id
+                    ));
                     return;
-                }
-
-                if let Some(handle) = self.summons[index].handle {
-                    if let Some(chr) = chr_by_handle_mut(world_chr_man, handle) {
-                        activate_existing_summon(chr, position, player_yaw, config, settings);
-                        self.summons[index].requested_at = now;
-                        self.summons[index].expires_at = now + config.fallback_lifetime(settings);
-                        self.summons[index].active = true;
-                        self.summons[index].pending_bind = false;
-                        return;
-                    }
                 }
 
                 self.summons.swap_remove(index);
@@ -547,6 +641,7 @@ impl AttackSummonState {
             handle: None,
             active: true,
             pending_bind: true,
+            destroy_at: None,
         });
     }
 
@@ -571,17 +666,79 @@ impl AttackSummonState {
                 }
             };
 
-            if should_remove {
-                if settings.reuse_spawned_units && self.summons[index].handle.is_some() {
-                    let summon = &mut self.summons[index];
-                    park_summon(world_chr_man, summon, settings);
-                    index += 1;
-                } else {
-                    let summon = self.summons.swap_remove(index);
-                    release_summon(world_chr_man, &summon);
-                }
-            } else {
+            if !should_remove {
                 index += 1;
+                continue;
+            }
+
+            if settings.remove_mode == RemoveMode::Destroy {
+                // Stage the unit first: make it inert and release its event ids,
+                // then let at least one tick pass before the character is torn
+                // down, so no other system is mid-iteration over it.
+                let ready = if self.summons[index].destroy_at.is_none() {
+                    let summon = &mut self.summons[index];
+                    let handle_text = match summon.handle {
+                        Some(handle) => handle.to_string(),
+                        None => "none".to_string(),
+                    };
+                    let (released, consistent) = match summon.handle {
+                        Some(handle) => release_summon_event_ids(world_chr_man, handle),
+                        None => (0, true),
+                    };
+                    release_summon(world_chr_man, summon);
+                    summon.destroy_at = Some(
+                        now.checked_add(settings.destroy_delay())
+                            .unwrap_or(now),
+                    );
+                    let config = settings.summons[summon.config_index];
+                    log_line(format_args!(
+                        "summon staged for removal: handle={handle_text} npc_param_id={} \
+                         configured_event_entity_id={} released_event_ids={released} \
+                         entry_consistent={consistent}",
+                        config.npc_param_id, config.event_entity_id
+                    ));
+                    false
+                } else {
+                    self.summons[index]
+                        .destroy_at
+                        .is_some_and(|at| now >= at)
+                };
+
+                if ready {
+                    let summon = self.summons.swap_remove(index);
+                    if let Some(handle) = summon.handle {
+                        let config = settings.summons[summon.config_index];
+                        let outcome = destroy_summon(world_chr_man, handle);
+                        let (ids, capacity) = chr_set_usage(world_chr_man, handle);
+                        log_line(format_args!(
+                            "summon removed: handle={handle} npc_param_id={} \
+                             event_entity_id={} outcome={outcome} set_event_ids={ids} \
+                             set_capacity={capacity}",
+                            config.npc_param_id, config.event_entity_id
+                        ));
+                        match outcome {
+                            DestroyOutcome::NotFound | DestroyOutcome::EntryMismatch => {
+                                log_line(format_args!(
+                                    "summon removal warning: handle={handle} was not removed \
+                                     ({outcome}); the unit may still be resident"
+                                ));
+                            }
+                            DestroyOutcome::Destroyed | DestroyOutcome::EntryCleared => {}
+                        }
+                    }
+                } else {
+                    index += 1;
+                }
+            } else if settings.reuses_units() && self.summons[index].handle.is_some() {
+                let summon = &mut self.summons[index];
+                park_summon(world_chr_man, summon, settings);
+                index += 1;
+            } else {
+                let summon = self.summons.swap_remove(index);
+                if let Some(handle) = summon.handle {
+                    release_summon_event_ids(world_chr_man, handle);
+                }
+                release_summon(world_chr_man, &summon);
             }
         }
     }
@@ -607,15 +764,75 @@ impl AttackSummonState {
 
         prepare_summon(chr, config, settings);
         chr.modules.as_mut().event.as_mut().request_animation_id = config.animation_id;
-        self.summons[summon_index].handle = Some(chr.field_ins_handle);
+        let handle = chr.field_ins_handle;
+        self.summons[summon_index].handle = Some(handle);
         self.summons[summon_index].active = true;
         self.summons[summon_index].pending_bind = false;
         world_chr_man.debug_chr_creator.last_created_chr = None;
+
+        // Make the configured entity id real and report what actually happened, so
+        // the mapping can be confirmed from the log instead of from a debugger.
+        let outcome = register_event_entity_id(world_chr_man, handle, config.event_entity_id);
+        let chr_reports_id =
+            character_reports_event_entity_id(world_chr_man, handle, config.event_entity_id)
+                .unwrap_or(false);
+        // End to end check: resolving the configured id has to lead back to this
+        // very unit, which is what event scripts do.
+        let id_leads_back = entity_id_owner(world_chr_man, handle, config.event_entity_id)
+            == Some(handle);
+        let (ids, capacity) = chr_set_usage(world_chr_man, handle);
+        log_line(format_args!(
+            "summon bound: handle={handle} npc_param_id={} configured_event_entity_id={} \
+             chr_reports_id={chr_reports_id} id_resolves_to_this_unit={id_leads_back} \
+             entity_id_outcome={outcome} set_event_ids={ids} set_capacity={capacity}",
+            config.npc_param_id, config.event_entity_id,
+        ));
+        match outcome {
+            EntityIdOutcome::Conflict => log_line(format_args!(
+                "summon warning: event_entity_id={} is already owned by another character in \
+                 this character set; the configured id was NOT applied",
+                config.event_entity_id
+            )),
+            EntityIdOutcome::EntryMismatch => log_line(format_args!(
+                "summon warning: handle={handle} and its character set entry disagree; the \
+                 configured event_entity_id={} was NOT applied",
+                config.event_entity_id
+            )),
+            _ if config.event_entity_id > 0 && !id_leads_back => log_line(format_args!(
+                "summon warning: event_entity_id={} does not resolve back to handle={handle}; \
+                 event scripts will not find this unit through that id",
+                config.event_entity_id
+            )),
+            _ => {}
+        }
     }
 
-    fn release_all(&mut self, world_chr_man: &mut WorldChrMan) {
+    /// Drops every summon, for instance when the local player leaves the session.
+    ///
+    /// The removal path stays the same on purpose: it clears the character set
+    /// entry as its last step, which turns a later engine-side character set
+    /// teardown into a no-op for that slot instead of a second free. When the
+    /// engine has already torn the set down the handle stops resolving, so
+    /// nothing is freed and the outcome says so.
+    fn release_all(&mut self, world_chr_man: &mut WorldChrMan, settings: &AttackSummonSettings) {
         for summon in &self.summons {
+            let config = settings.summons[summon.config_index];
+            if let Some(handle) = summon.handle {
+                release_summon_event_ids(world_chr_man, handle);
+            }
             release_summon(world_chr_man, summon);
+            if settings.remove_mode == RemoveMode::Destroy
+                && let Some(handle) = summon.handle
+            {
+                let outcome = destroy_summon(world_chr_man, handle);
+                let (ids, capacity) = chr_set_usage(world_chr_man, handle);
+                log_line(format_args!(
+                    "summon removed (reset): handle={handle} npc_param_id={} \
+                     event_entity_id={} outcome={outcome} set_event_ids={ids} \
+                     set_capacity={capacity}",
+                    config.npc_param_id, config.event_entity_id
+                ));
+            }
         }
         self.summons.clear();
     }
@@ -948,6 +1165,18 @@ fn default_disable_lock_on() -> bool {
     false
 }
 
+fn default_destroy_delay_ms() -> u64 {
+    0
+}
+
+fn default_register_event_entity_id() -> bool {
+    true
+}
+
+fn default_log_enabled() -> bool {
+    true
+}
+
 fn default_config_chr_id() -> i32 {
     4205
 }
@@ -1097,6 +1326,47 @@ mod tests {
         );
         assert_eq!(DEBUG_CREATOR_SPAWN_ROTATION_OFFSET, 0x10);
         assert_eq!(DEBUG_CREATOR_ENEMY_TYPE_OFFSET, 0xc8);
+    }
+
+    /// Pins the offsets the lifecycle module was written against.
+    ///
+    /// Each value below comes from disassembling WW 2.7.1.0, so the assertions
+    /// fail loudly if a future binding revision moves a field the removal path
+    /// depends on. See `docs/compatibility/engine-chr-lifecycle.md`.
+    #[test]
+    fn pinned_chr_lifecycle_offsets_match_disassembly() {
+        use eldenring::cs::{ChrSet, ChrSetEntry, PlayerIns};
+        use std::mem::{offset_of, size_of};
+
+        // ChrIns: vftable +0x00, handle +0x08, chr_set_entry +0x10, event id +0x1e8.
+        assert_eq!(offset_of!(ChrIns, vftable), 0x00);
+        assert_eq!(offset_of!(ChrIns, field_ins_handle), 0x08);
+        assert_eq!(offset_of!(ChrIns, chr_set_entry), 0x10);
+        assert_eq!(offset_of!(ChrIns, event_entity_id), 0x1e8);
+
+        // ChrSet: capacity +0x10, entries +0x18, entity id map +0x28, group map +0x40.
+        assert_eq!(offset_of!(ChrSet<ChrIns>, capacity), 0x10);
+        assert_eq!(offset_of!(ChrSet<ChrIns>, entries), 0x18);
+        assert_eq!(offset_of!(ChrSet<ChrIns>, entity_id_mapping), 0x28);
+        assert_eq!(offset_of!(ChrSet<ChrIns>, group_id_mapping), 0x40);
+
+        // ChrSetEntry is the 0x10 byte stride free_chr_list walks the array with.
+        assert_eq!(size_of::<ChrSetEntry<ChrIns>>(), 0x10);
+        assert_eq!(offset_of!(ChrSetEntry<ChrIns>, chr_ins), 0x00);
+        assert_eq!(offset_of!(ChrSetEntry<ChrIns>, chr_load_status), 0x08);
+        assert_eq!(offset_of!(ChrSetEntry<ChrIns>, chr_update_type), 0x09);
+        assert_eq!(offset_of!(ChrSetEntry<ChrIns>, entry_flags), 0x0a);
+
+        // DLMap: allocator +0x00, node head +0x08, size +0x10, so 0x18 bytes. The
+        // map is the last member of ChrSet, so the tail of the structure measures
+        // it without the private `eldenring::stl` module having to be nameable.
+        assert_eq!(
+            size_of::<ChrSet<ChrIns>>() - offset_of!(ChrSet<ChrIns>, group_id_mapping),
+            0x18
+        );
+
+        // Lock-on has to be cleared before the character is freed.
+        assert_eq!(offset_of!(PlayerIns, locked_on_enemy), 0x6b0);
     }
 
     #[test]

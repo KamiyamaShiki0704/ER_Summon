@@ -34,7 +34,26 @@ Trigger Speffects are consumed from the local player as one-shot requests. The g
 
 New and reused units face the local player's current horizontal facing direction when activated. Position offsets are separate from facing: forward/right use the camera's horizontal local axes, while up uses the world vertical axis.
 
-With `reuse_spawned_units = true`, the DLL keeps one hidden generated entity for each `[[summons]]` entry and reuses it on later triggers. This prevents repeated activations from continuously consuming the debug/enemy character pool.
+### Entity ids
+
+`event_entity_id` is the id event scripts use to find and control a generated unit. `0` leaves a unit reachable only through its handle. For any other value Summon writes the id onto the character and registers it in the owning character set, so resolving the id leads back to that unit. An id another character in the same character set already owns is refused rather than stolen.
+
+Whether a given number is free depends on your own event id space, so Summon reports the outcome instead of guessing: `summon.log` records what every bind settled on, and warns when a configured id does not resolve back to its unit.
+
+### Removal
+
+`remove_mode` decides how a unit leaves the world.
+
+- `"destroy"` (default): the unit releases its event ids, runs the engine destructor and clears its character set entry, so it is really gone from memory instead of resident-but-hidden. Unit reuse is impossible by definition here, so it overrides `reuse_spawned_units`.
+- `"hide"`: only field writes. The unit stays resident and can be reused, which is the previous behavior.
+
+Removal is staged: a unit is first made inert and has its ids released, and is freed at least one tick later, so no other system is mid-iteration over it when it goes. `destroy_delay_ms` extends that gap. Because Summon clears the character set entry as its last step, a later engine-side teardown of the character set sees an empty slot and skips it rather than freeing the same address twice.
+
+With `reuse_spawned_units = true` and `remove_mode = "hide"`, the DLL keeps one hidden generated entity for each `[[summons]]` entry and reuses it on later triggers. This prevents repeated activations from continuously consuming the debug/enemy character pool.
+
+### Log
+
+`log_enabled = true` appends lifecycle evidence to `summon.log` next to the DLL: the startup summary, one `summon bound` line per activation, and one line per staged and completed removal. Each line carries the counts needed to check the claims without a debugger — the entity id outcome, whether the id resolves back to the unit, and the character set's id count before and after a removal.
 
 ## Configuration
 
@@ -54,6 +73,10 @@ Top-level settings provide defaults for every summon:
 - `any_trigger_cooldown_ms`
 - `reuse_spawned_units`
 - `disable_lock_on`
+- `remove_mode`
+- `destroy_delay_ms`
+- `register_event_entity_id`
+- `log_enabled`
 
 Each `[[summons]]` entry supports:
 
@@ -87,7 +110,7 @@ For compatibility, existing configuration files may still use `spawn_forward_dis
 
 `disable_lock_on = true` disables lock-on for the whole generated character. It does not target one specific lock-on point ID.
 
-See [summon.toml](summon.toml) for a complete working configuration.
+See [summon.toml](summon.toml) for a complete working configuration, and [docs/compatibility/engine-chr-lifecycle.md](docs/compatibility/engine-chr-lifecycle.md) for the disassembly evidence behind the entity id and removal behavior.
 
 ## Build
 

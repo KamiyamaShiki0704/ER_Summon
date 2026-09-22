@@ -17,11 +17,38 @@ any_trigger_cooldown_ms = 120
 reuse_spawned_units = true
 disable_lock_on = false
 
+# How a summon leaves the world:
+#   "destroy" (default) - release its event ids, run the engine destructor and
+#                         clear its character set entry, so the unit is really
+#                         gone from memory. Forces reuse_spawned_units off.
+#   "hide"              - only field writes; the unit stays resident and can be
+#                         reused, which is the older behavior.
+remove_mode = "destroy"
+
+# Grace period between making a unit inert and freeing it. 0 destroys on the
+# next tick; raise it if another system still needs to observe the unit.
+destroy_delay_ms = 0
+
+# Writes each configured event_entity_id onto the summon and registers it in the
+# character set so event scripts can resolve it back to the unit.
+register_event_entity_id = true
+
+# Appends lifecycle evidence to summon.log next to the DLL: what every bind
+# settled on and whether every removal really cleared the character set entry.
+log_enabled = true
+
 # The following global fields can also be set inside a [[summons]] entry.
 # Entry values override the global value only for that summon:
 # marker_speffect, vanish_request_speffect, generated_team_type,
 # fallback_lifetime_ms, offset_forward, offset_right, offset_up,
 # disable_lock_on.
+
+# event_entity_id is the id event scripts use to find and control this summon.
+# 0 means "do not register an id" and keeps the unit reachable only through its
+# handle. Pick a number that is free in your own event id space: the mod refuses
+# ids another character in the same character set already owns and says so in
+# summon.log, and it warns when a configured id does not resolve back to the
+# unit. Example for the first entry: event_entity_id = 42050001
 
 [[summons]]
 trigger_speffect = 14200120
@@ -35,6 +62,7 @@ animation_id = 20010
 offset_right = -1.25
 is_player = false
 # Example per-summon overrides:
+# event_entity_id = 42050001
 # marker_speffect = 14200128
 # vanish_request_speffect = 14200129
 # generated_team_type = 47
@@ -55,6 +83,7 @@ talk_id = 0
 animation_id = 20011
 offset_right = -0.75
 is_player = false
+# event_entity_id = 42050002
 
 [[summons]]
 trigger_speffect = 14200122
@@ -67,6 +96,7 @@ talk_id = 0
 animation_id = 20012
 offset_right = -0.25
 is_player = false
+# event_entity_id = 42050003
 
 [[summons]]
 trigger_speffect = 14200123
@@ -79,6 +109,7 @@ talk_id = 0
 animation_id = 20013
 offset_right = 0.25
 is_player = false
+# event_entity_id = 42050004
 
 [[summons]]
 trigger_speffect = 14200124
@@ -91,6 +122,7 @@ talk_id = 0
 animation_id = 20017
 offset_right = 0.75
 is_player = false
+# event_entity_id = 42050005
 
 [[summons]]
 trigger_speffect = 14200125
@@ -103,3 +135,4 @@ talk_id = 0
 animation_id = 20018
 offset_right = 1.25
 is_player = false
+# event_entity_id = 42050006
