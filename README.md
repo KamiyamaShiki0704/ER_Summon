@@ -1,5 +1,7 @@
 # Summon
 
+中文 | [English](README.en.md)
+
 用于《艾尔登法环》的独立召唤 DLL。通过施加给玩家的 SpEffect 触发 NPC 召唤，可配置模型、参数、动画、阵营、位置、存活时间和事件实体 ID。
 
 ## 安装
@@ -69,7 +71,7 @@ log_enabled = true
 
 ```toml
 # 在目标 [[summons]] 条目内设置
- event_entity_id = 13000890
+event_entity_id = 13000890
 ```
 
 此数字仅为示例，使用前应确认自己的地图与事件没有占用它。注册包括角色字段、实体映射及原生分组注册。
