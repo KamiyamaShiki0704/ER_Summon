@@ -1,5 +1,6 @@
 marker_speffect = 14200128
 vanish_request_speffect = 14200129
+# Applied on activation only; each summon may override this value.
 generated_team_type = 47
 max_active_summons = 8
 start_delay_ms = 5000
@@ -60,6 +61,7 @@ npc_param_id = 42050100
 npc_think_param_id = 42050000
 event_entity_id = 0
 talk_id = 0
+# -1 skips the spawn animation request; normal AI/event animations still run.
 animation_id = 20010
 offset_right = -1.25
 is_player = false
@@ -82,6 +84,7 @@ npc_param_id = 42050101
 npc_think_param_id = 42050000
 event_entity_id = 0
 talk_id = 0
+# -1 skips the spawn animation request; normal AI/event animations still run.
 animation_id = 20011
 offset_right = -0.75
 is_player = false
@@ -95,6 +98,7 @@ npc_param_id = 42050102
 npc_think_param_id = 42050000
 event_entity_id = 0
 talk_id = 0
+# -1 skips the spawn animation request; normal AI/event animations still run.
 animation_id = 20012
 offset_right = -0.25
 is_player = false
@@ -108,6 +112,7 @@ npc_param_id = 42050103
 npc_think_param_id = 42050000
 event_entity_id = 0
 talk_id = 0
+# -1 skips the spawn animation request; normal AI/event animations still run.
 animation_id = 20013
 offset_right = 0.25
 is_player = false
@@ -121,6 +126,7 @@ npc_param_id = 42050104
 npc_think_param_id = 42050000
 event_entity_id = 0
 talk_id = 0
+# -1 skips the spawn animation request; normal AI/event animations still run.
 animation_id = 20017
 offset_right = 0.75
 is_player = false
@@ -134,6 +140,7 @@ npc_param_id = 42050105
 npc_think_param_id = 42050000
 event_entity_id = 0
 talk_id = 0
+# -1 skips the spawn animation request; normal AI/event animations still run.
 animation_id = 20018
 offset_right = 1.25
 is_player = false

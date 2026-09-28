@@ -53,7 +53,7 @@ Each `[[summons]]` entry defines a summon type.
 | `chara_init_param_id` | CharaInitParam ID |
 | `npc_param_id` / `npc_think_param_id` | NPC and AI parameter IDs |
 | `event_entity_id` | Entity ID used by event scripts; 0 skips registration |
-| `animation_id` | Animation requested on activation |
+| `animation_id` | Animation requested on activation; `-1` skips the spawn animation request |
 | `talk_id` / `is_player` | Talk ID and character creation type |
 | `offset_forward` | Camera-relative horizontal offset; positive is forward |
 | `offset_right` | Camera-relative horizontal offset; positive is right |
@@ -64,6 +64,12 @@ Entries can override the global `marker_speffect`, `vanish_request_speffect`, `g
 Activated units face the player's current horizontal facing direction. Position offsets use the camera orientation and are calculated separately.
 `disable_lock_on = true` disables lock-on for the entire summoned character.
 Legacy position names `spawn_forward_distance`, `side_offset`, and `spawn_height_offset` remain accepted. Do not specify both the old and new names for an axis in the same scope.
+
+### Team and spawn animation
+
+Set `generated_team_type` globally or override it per `[[summons]]` entry. The default remains 47. The team is applied only on initial binding or reactivation of a hidden unit; ongoing updates no longer overwrite later team changes made by events or other systems.
+
+With `animation_id = -1`, the DLL neither writes a spawn animation request nor clears another system's request. Normal AI, state-machine, and event-driven animations still run; this does not freeze the character. Other animation IDs retain their existing behavior.
 
 ### Event entity IDs
 

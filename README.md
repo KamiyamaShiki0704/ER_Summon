@@ -53,7 +53,7 @@ log_enabled = true
 | `chara_init_param_id` | CharaInitParam 参数 |
 | `npc_param_id` / `npc_think_param_id` | NPC 参数和 AI 参数 |
 | `event_entity_id` | 事件脚本控制使用的实体 ID；0 不注册 |
-| `animation_id` | 激活时播放的动画 |
+| `animation_id` | 激活时请求播放的动画；`-1` 不请求出生动画 |
 | `talk_id` / `is_player` | 对话 ID 与创建类型 |
 | `offset_forward` | 沿相机水平朝向偏移，正数向前 |
 | `offset_right` | 沿相机水平方向偏移，正数向右 |
@@ -64,6 +64,12 @@ log_enabled = true
 单位激活时朝向玩家当前的水平方向。位置偏移使用相机方向，二者分别计算。
 `disable_lock_on = true` 禁止锁定整个召唤角色。
 兼容旧位置字段 `spawn_forward_distance`、`side_offset`、`spawn_height_offset`；同一配置范围内不要同时填写新旧名称。
+
+### 阵营与出生动画
+
+`generated_team_type` 可设置全局默认阵营，也可在每个 `[[summons]]` 内单独覆盖；未配置时默认 47。阵营仅在首次绑定或隐藏单位重新激活时设置，存活更新不再覆盖事件或其他系统随后修改的阵营。
+
+`animation_id = -1` 表示 DLL 不写入出生动画请求，也不清除其他系统的动画请求；单位仍会按游戏 AI、状态机或事件正常播放动画，并非冻结动作。其他动画 ID 保持原有行为。
 
 ### 事件实体 ID
 

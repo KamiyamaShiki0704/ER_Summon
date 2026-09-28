@@ -854,7 +854,10 @@ impl AttackSummonState {
         };
 
         prepare_summon(chr, config, settings);
-        chr.modules.as_mut().event.as_mut().request_animation_id = config.animation_id;
+        chr.team_type = config.generated_team_type(settings);
+        request_spawn_animation(config.animation_id, false, |id| {
+            chr.modules.as_mut().event.as_mut().request_animation_id = id;
+        });
         let handle = chr.field_ins_handle;
         self.summons[summon_index].handle = Some(handle);
         self.summons[summon_index].active = true;
@@ -1033,8 +1036,22 @@ fn activate_existing_summon(
     prepare_summon(chr, config, settings);
     move_summon(chr, position, player_yaw);
     restore_summon_hp(chr);
-    chr.modules.as_mut().event.as_mut().request_animation_id = -1;
-    chr.modules.as_mut().event.as_mut().request_animation_id = config.animation_id;
+    chr.team_type = config.generated_team_type(settings);
+    request_spawn_animation(config.animation_id, true, |id| {
+        chr.modules.as_mut().event.as_mut().request_animation_id = id;
+    });
+}
+
+// -1 means no request at all, including no reset of another system's request.
+// Explicit animations retain the reset needed when reactivating a hidden unit.
+fn request_spawn_animation(animation_id: i32, reused: bool, mut write: impl FnMut(i32)) {
+    if animation_id == -1 {
+        return;
+    }
+    if reused {
+        write(-1);
+    }
+    write(animation_id);
 }
 
 fn move_summon(chr: &mut ChrIns, position: HavokPosition, yaw: f32) {
@@ -1061,7 +1078,6 @@ fn prepare_summon(chr: &mut ChrIns, config: AttackSummonConfig, settings: &Attac
         chr.apply_speffect(marker_speffect, true);
     }
 
-    chr.team_type = config.generated_team_type(settings);
     chr.chr_ctrl
         .as_mut()
         .modifier
@@ -1387,6 +1403,38 @@ fn default_summons() -> Vec<AttackSummonConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_animation_minus_one_does_not_touch_pending_request() {
+        for reused in [false, true] {
+            let mut writes = Vec::new();
+            request_spawn_animation(-1, reused, |id| writes.push(id));
+            assert!(writes.is_empty());
+            request_spawn_animation(20012, reused, |id| writes.push(id));
+            assert_eq!(writes, if reused { vec![-1, 20012] } else { vec![20012] });
+        }
+    }
+
+    #[test]
+    fn summon_team_override_and_no_animation_parse_together() {
+        let settings: AttackSummonSettings = toml::from_str(r#"
+generated_team_type = 6
+[[summons]]
+trigger_speffect = 1
+npc_param_id = 2
+animation_id = -1
+generated_team_type = 26
+[[summons]]
+trigger_speffect = 2
+npc_param_id = 3
+animation_id = -1
+"#).unwrap();
+        assert_eq!(settings.summons[0].generated_team_type(&settings), 26);
+        assert_eq!(settings.summons[1].generated_team_type(&settings), 6);
+        assert_eq!(settings.summons[0].animation_id, -1);
+        assert_eq!(settings.summons[1].animation_id, -1);
+        assert_eq!(AttackSummonSettings::default().generated_team_type, 47);
+    }
 
     #[test]
     fn unlimited_lifetime_and_entry_overrides() {
