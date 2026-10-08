@@ -357,6 +357,14 @@ enum RemoveMode {
     Destroy,
 }
 
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum OffsetSpace {
+    #[default]
+    Camera,
+    World,
+}
+
 #[derive(Clone, Deserialize)]
 struct AttackSummonSettings {
     #[serde(default = "default_marker_speffect")]
@@ -373,6 +381,8 @@ struct AttackSummonSettings {
     unbound_timeout_ms: u64,
     #[serde(default = "default_fallback_lifetime_ms")]
     fallback_lifetime_ms: i64,
+    #[serde(default)]
+    offset_space: OffsetSpace,
     #[serde(default = "default_offset_forward", alias = "spawn_forward_distance")]
     offset_forward: f32,
     #[serde(default = "default_offset_right")]
@@ -409,6 +419,7 @@ impl Default for AttackSummonSettings {
             start_delay_ms: default_start_delay_ms(),
             unbound_timeout_ms: default_unbound_timeout_ms(),
             fallback_lifetime_ms: default_fallback_lifetime_ms(),
+            offset_space: OffsetSpace::default(),
             offset_forward: default_offset_forward(),
             offset_right: default_offset_right(),
             offset_up: default_offset_up(),
@@ -465,11 +476,15 @@ fn load_settings() -> AttackSummonSettings {
     let Ok(text) = fs::read_to_string(path) else {
         return AttackSummonSettings::default();
     };
-    let Ok(mut settings) = toml::from_str::<AttackSummonSettings>(&text) else {
+    parse_settings(&text)
+}
+
+fn parse_settings(text: &str) -> AttackSummonSettings {
+    let Ok(mut settings) = toml::from_str::<AttackSummonSettings>(text) else {
         return AttackSummonSettings::default();
     };
     settings.summons.retain(|config| {
-        config.trigger_speffect > 0 && config.chr_id > 0 && config.npc_param_id > 0
+        config.trigger_speffect > 0 && config.chr_id >= 0 && config.npc_param_id > 0
     });
     if settings.summons.is_empty() {
         settings.summons = default_summons();
@@ -522,6 +537,8 @@ struct AttackSummonConfig {
     generated_team_type: Option<u8>,
     #[serde(default)]
     fallback_lifetime_ms: Option<i64>,
+    #[serde(default)]
+    offset_space: Option<OffsetSpace>,
     #[serde(default, alias = "spawn_forward_distance")]
     offset_forward: Option<f32>,
     #[serde(default, alias = "side_offset")]
@@ -533,6 +550,10 @@ struct AttackSummonConfig {
 }
 
 impl AttackSummonConfig {
+    fn offset_space(&self, settings: &AttackSummonSettings) -> OffsetSpace {
+        self.offset_space.unwrap_or(settings.offset_space)
+    }
+
     fn marker_speffect(&self, settings: &AttackSummonSettings) -> i32 {
         self.marker_speffect.unwrap_or(settings.marker_speffect)
     }
@@ -715,7 +736,7 @@ impl AttackSummonState {
                 npc_think_param_id: config.npc_think_param_id,
                 event_entity_id: config.event_entity_id,
                 talk_id: config.talk_id,
-                is_player: config.is_player,
+                is_player: uses_player_creation(config.chr_id, config.is_player),
                 pos_x: position.0,
                 pos_y: position.1,
                 pos_z: position.2,
@@ -853,7 +874,7 @@ impl AttackSummonState {
             return;
         };
 
-        prepare_summon(chr, config, settings);
+        prepare_summon(chr, config, settings, SummonPreparation::Binding);
         chr.team_type = config.generated_team_type(settings);
         request_spawn_animation(config.animation_id, false, |id| {
             chr.modules.as_mut().event.as_mut().request_animation_id = id;
@@ -952,7 +973,7 @@ fn spawn_debug_character(
         return false;
     }
 
-    let mut name_bytes = format!("c{:0>4}", request.chr_id)
+    let mut name_bytes = character_model_name(request.chr_id)
         .encode_utf16()
         .collect::<Vec<_>>();
     name_bytes.resize(0x20, 0);
@@ -980,6 +1001,16 @@ fn spawn_debug_character(
     true
 }
 
+fn character_model_name(chr_id: i32) -> String {
+    format!("c{:0>4}", chr_id)
+}
+
+fn uses_player_creation(chr_id: i32, is_player: bool) -> bool {
+    // c0000 NPCs share the player-character creation path; this does not
+    // designate them as the local player or replace the main_player pointer.
+    chr_id == 0 || is_player
+}
+
 fn summon_should_disappear(
     world_chr_man: &mut WorldChrMan,
     summon: &AttackSummonInstance,
@@ -1002,7 +1033,7 @@ fn summon_should_disappear(
         return true;
     }
 
-    prepare_summon(chr, config, settings);
+    prepare_summon(chr, config, settings, SummonPreparation::Updating);
     false
 }
 
@@ -1013,6 +1044,10 @@ fn summon_position(
     config: AttackSummonConfig,
     settings: &AttackSummonSettings,
 ) -> HavokPosition {
+    let (forward, right) = match config.offset_space(settings) {
+        OffsetSpace::Camera => (forward, right),
+        OffsetSpace::World => ((0.0, 0.0, 1.0), (1.0, 0.0, 0.0)),
+    };
     HavokPosition(
         player_pos.0
             + forward.0 * config.offset_forward(settings)
@@ -1033,7 +1068,7 @@ fn activate_existing_summon(
     settings: &AttackSummonSettings,
 ) {
     chr.remove_speffect(config.vanish_request_speffect(settings));
-    prepare_summon(chr, config, settings);
+    prepare_summon(chr, config, settings, SummonPreparation::Reactivating);
     move_summon(chr, position, player_yaw);
     restore_summon_hp(chr);
     chr.team_type = config.generated_team_type(settings);
@@ -1072,7 +1107,33 @@ fn move_summon(chr: &mut ChrIns, position: HavokPosition, yaw: f32) {
         .set_rotation_sync_requested(true);
 }
 
-fn prepare_summon(chr: &mut ChrIns, config: AttackSummonConfig, settings: &AttackSummonSettings) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SummonPreparation {
+    Binding,
+    Updating,
+    Reactivating,
+}
+
+// Field order: animation opacity, previous opacity, tint, tint modifier,
+// camouflage, base transparency, base modifier.
+fn update_summon_visibility(phase: SummonPreparation, fields: [&mut f32; 7]) {
+    if phase == SummonPreparation::Reactivating {
+        // park_summon only zeros these four fields. Animation keyframe opacity
+        // and camouflage remain owned by the engine even during reactivation.
+        for (index, value) in fields.into_iter().enumerate() {
+            if matches!(index, 2 | 3 | 5 | 6) {
+                *value = 1.0;
+            }
+        }
+    }
+}
+
+fn prepare_summon(
+    chr: &mut ChrIns,
+    config: AttackSummonConfig,
+    settings: &AttackSummonSettings,
+    phase: SummonPreparation,
+) {
     let marker_speffect = config.marker_speffect(settings);
     if !chr_has_speffect(chr, marker_speffect) {
         chr.apply_speffect(marker_speffect, true);
@@ -1085,6 +1146,20 @@ fn prepare_summon(chr: &mut ChrIns, config: AttackSummonConfig, settings: &Attac
         .data
         .action_flags
         .set_disable_lock_on(config.disable_lock_on(settings));
+    update_summon_visibility(phase, [
+        &mut chr.opacity_keyframes_multiplier,
+        &mut chr.opacity_keyframes_multiplier_previous,
+        &mut chr.tint_alpha_multiplier,
+        &mut chr.tint_alpha_multiplier_modifier,
+        &mut chr.camouflage_transparency,
+        &mut chr.base_transparency,
+        &mut chr.base_transparency_modifier,
+    ]);
+    if phase == SummonPreparation::Updating {
+        // Animation notifies and events can control render/activation flags.
+        // A live update should not repeat the initial visibility setup.
+        return;
+    }
     chr.last_hit_by = FieldInsHandle {
         selector: FieldInsSelector(u32::MAX),
         block_id: BlockId::none(),
@@ -1103,13 +1178,6 @@ fn prepare_summon(chr: &mut ChrIns, config: AttackSummonConfig, settings: &Attac
     debug_flags.set_disabled_hit(false);
     debug_flags.set_disabled_movement(false);
     debug_flags.set_disabled_secondary_actions(false);
-    chr.opacity_keyframes_multiplier = 1.0;
-    chr.opacity_keyframes_multiplier_previous = 1.0;
-    chr.tint_alpha_multiplier = 1.0;
-    chr.tint_alpha_multiplier_modifier = 1.0;
-    chr.camouflage_transparency = 1.0;
-    chr.base_transparency = 1.0;
-    chr.base_transparency_modifier = 1.0;
 }
 
 fn restore_summon_hp(chr: &mut ChrIns) {
@@ -1298,6 +1366,7 @@ fn default_summons() -> Vec<AttackSummonConfig> {
             vanish_request_speffect: None,
             generated_team_type: None,
             fallback_lifetime_ms: None,
+            offset_space: None,
             offset_forward: None,
             offset_up: None,
             disable_lock_on: None,
@@ -1317,6 +1386,7 @@ fn default_summons() -> Vec<AttackSummonConfig> {
             vanish_request_speffect: None,
             generated_team_type: None,
             fallback_lifetime_ms: None,
+            offset_space: None,
             offset_forward: None,
             offset_up: None,
             disable_lock_on: None,
@@ -1336,6 +1406,7 @@ fn default_summons() -> Vec<AttackSummonConfig> {
             vanish_request_speffect: None,
             generated_team_type: None,
             fallback_lifetime_ms: None,
+            offset_space: None,
             offset_forward: None,
             offset_up: None,
             disable_lock_on: None,
@@ -1355,6 +1426,7 @@ fn default_summons() -> Vec<AttackSummonConfig> {
             vanish_request_speffect: None,
             generated_team_type: None,
             fallback_lifetime_ms: None,
+            offset_space: None,
             offset_forward: None,
             offset_up: None,
             disable_lock_on: None,
@@ -1374,6 +1446,7 @@ fn default_summons() -> Vec<AttackSummonConfig> {
             vanish_request_speffect: None,
             generated_team_type: None,
             fallback_lifetime_ms: None,
+            offset_space: None,
             offset_forward: None,
             offset_up: None,
             disable_lock_on: None,
@@ -1393,6 +1466,7 @@ fn default_summons() -> Vec<AttackSummonConfig> {
             vanish_request_speffect: None,
             generated_team_type: None,
             fallback_lifetime_ms: None,
+            offset_space: None,
             offset_forward: None,
             offset_up: None,
             disable_lock_on: None,
@@ -1403,6 +1477,113 @@ fn default_summons() -> Vec<AttackSummonConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn world_offsets_ignore_camera_axes_and_camera_offsets_rotate() {
+        let mut settings = AttackSummonSettings::default();
+        settings.offset_forward = 3.0;
+        settings.offset_right = -2.0;
+        settings.offset_up = 0.5;
+        let mut config = settings.summons[0];
+        config.offset_right = None;
+        let origin = HavokPosition(10.0, 20.0, 30.0, 0.0);
+        let rotated = ((1.0, 0.0, 0.0), (0.0, 0.0, -1.0));
+        let standard = ((0.0, 0.0, 1.0), (1.0, 0.0, 0.0));
+        let coords = |p: HavokPosition| (p.0, p.1, p.2);
+        assert_eq!(config.offset_space(&settings), OffsetSpace::Camera);
+        assert_eq!(coords(summon_position(origin, rotated.0, rotated.1, config, &settings)), (13.0, 20.5, 32.0));
+        settings.offset_space = OffsetSpace::World;
+        for axes in [rotated, standard] {
+            assert_eq!(coords(summon_position(origin, axes.0, axes.1, config, &settings)), (8.0, 20.5, 33.0));
+        }
+        config.offset_space = Some(OffsetSpace::Camera);
+        assert_eq!(coords(summon_position(origin, rotated.0, rotated.1, config, &settings)), (13.0, 20.5, 32.0));
+        config.offset_space = Some(OffsetSpace::World);
+        config.offset_forward = Some(-4.0);
+        config.offset_right = Some(5.0);
+        config.offset_up = Some(-1.0);
+        settings.offset_space = OffsetSpace::Camera;
+        assert_eq!(coords(summon_position(origin, rotated.0, rotated.1, config, &settings)), (15.0, 19.0, 26.0));
+    }
+
+    #[test]
+    fn offset_space_parses_global_entry_override_and_legacy_default() {
+        let text = r#"
+offset_space = "world"
+[[summons]]
+trigger_speffect = 1
+npc_param_id = 2
+animation_id = -1
+[[summons]]
+trigger_speffect = 2
+npc_param_id = 3
+animation_id = -1
+offset_space = "camera"
+"#;
+        let settings: AttackSummonSettings = toml::from_str(text).unwrap();
+        assert_eq!(settings.summons[0].offset_space(&settings), OffsetSpace::World);
+        assert_eq!(settings.summons[1].offset_space(&settings), OffsetSpace::Camera);
+        let legacy: AttackSummonSettings = toml::from_str(&text.replace("offset_space = \"world\"", "")).unwrap();
+        assert_eq!(legacy.summons[0].offset_space(&legacy), OffsetSpace::Camera);
+        assert!(toml::from_str::<AttackSummonSettings>(&text.replace("\"world\"", "\"wrold\"")).is_err());
+    }
+
+    #[test]
+    fn animation_fade_survives_summon_binding_and_updates() {
+        let mut alpha = [0.8, 0.9, 0.7, 0.6, 0.5, 0.4, 0.3];
+        let expected = alpha;
+        update_summon_visibility(SummonPreparation::Binding, alpha.each_mut());
+        assert_eq!(alpha, expected, "binding must preserve an already-started animation fade");
+        // Replay animation-written values through the production update seam.
+        for opacity in [0.75, 0.5, 0.25, 0.0, 0.25, 0.5, 1.0] {
+            alpha = [opacity, opacity, 0.7, 0.6, 0.5, 0.4, 0.3];
+            let expected = alpha;
+            update_summon_visibility(SummonPreparation::Updating, alpha.each_mut());
+            assert_eq!(alpha, expected, "summon update overwrote the animation's alpha");
+        }
+    }
+
+    #[test]
+    fn hidden_reactivation_restores_only_fields_changed_by_parking() {
+        let mut alpha = [0.35, 0.4, 0.0, 0.0, 0.6, 0.0, 0.0];
+        update_summon_visibility(SummonPreparation::Reactivating, alpha.each_mut());
+        assert_eq!(alpha, [0.35, 0.4, 1.0, 1.0, 0.6, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn humanoid_config_survives_runtime_filter_and_uses_player_creation() {
+        let settings = parse_settings(r#"
+[[summons]]
+trigger_speffect = 3269
+chr_id = 0
+chara_init_param_id = 23090
+npc_param_id = 523090010
+npc_think_param_id = 523090010
+animation_id = -1
+[[summons]]
+trigger_speffect = 14200120
+chr_id = 4205
+npc_param_id = 42050100
+animation_id = 20010
+[[summons]]
+trigger_speffect = 99
+chr_id = -1
+npc_param_id = 1
+animation_id = -1
+"#);
+        assert_eq!(settings.summons.len(), 2);
+        let human = settings.summons[0];
+        assert_eq!(character_model_name(human.chr_id), "c0000");
+        assert!(uses_player_creation(human.chr_id, human.is_player));
+        assert_eq!(human.chara_init_param_id, 23090);
+        assert_eq!(human.npc_param_id, 523090010);
+        assert_eq!(human.npc_think_param_id, 523090010);
+        assert_eq!(human.animation_id, -1);
+        let enemy = settings.summons[1];
+        assert_eq!(character_model_name(enemy.chr_id), "c4205");
+        assert!(!uses_player_creation(enemy.chr_id, enemy.is_player));
+        assert!(uses_player_creation(enemy.chr_id, true));
+    }
 
     #[test]
     fn spawn_animation_minus_one_does_not_touch_pending_request() {

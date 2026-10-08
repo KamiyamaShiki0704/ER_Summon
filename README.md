@@ -55,15 +55,24 @@ log_enabled = true
 | `event_entity_id` | 事件脚本控制使用的实体 ID；0 不注册 |
 | `animation_id` | 激活时请求播放的动画；`-1` 不请求出生动画 |
 | `talk_id` / `is_player` | 对话 ID 与创建类型 |
-| `offset_forward` | 沿相机水平朝向偏移，正数向前 |
-| `offset_right` | 沿相机水平方向偏移，正数向右 |
+| `offset_space` | `camera` 相机水平轴；`world` 固定世界轴，默认 `camera` |
+| `offset_forward` | 正数沿相机水平前方或世界 +Z |
+| `offset_right` | 正数沿相机水平右方或世界 +X |
 | `offset_up` | 世界竖直偏移，正数向上 |
 
-条目可覆盖全局的 `marker_speffect`、`vanish_request_speffect`、`generated_team_type`、`fallback_lifetime_ms`、三个位置偏移和 `disable_lock_on`。省略时继承全局值。
+条目可覆盖全局的 `marker_speffect`、`vanish_request_speffect`、`generated_team_type`、`fallback_lifetime_ms`、`offset_space`、三个位置偏移和 `disable_lock_on`。省略时继承全局值。
 
-单位激活时朝向玩家当前的水平方向。位置偏移使用相机方向，二者分别计算。
+单位激活时朝向玩家当前的水平方向。位置偏移使用所选坐标轴，二者分别计算。
+
+全局或条目中设置 `offset_space = "camera"` 可让偏移随相机水平转动；设置 `offset_space = "world"` 则使用固定世界坐标轴：`offset_right` 加到 X，`offset_up` 加到 Y，`offset_forward` 加到 Z。两种模式都以玩家世界位置为起点。世界模式不是玩家朝向模式，也不是指定绝对生成坐标。省略此项继续使用相机模式。
 `disable_lock_on = true` 禁止锁定整个召唤角色。
 兼容旧位置字段 `spawn_forward_distance`、`side_offset`、`spawn_height_offset`；同一配置范围内不要同时填写新旧名称。
+
+### 人形 NPC（c0000）
+
+使用 `chr_id = 0` 召唤人形 NPC。DLL 自动使用玩家角色类型的创建路径，不会替换本地玩家。填写目标 NPC 对应的 `chara_init_param_id`（装备和外观初始化）、`npc_param_id` 与 `npc_think_param_id`；参数必须在当前 regulation 中有效。`is_player = true` 可显式填写，c0000 即使省略也自动启用。
+
+随包配置提供注释掉的帕奇预设示例，来自 CT，需确认与你的参数文件匹配并选择未占用的触发效果。人形创建、事件控制和清理尚待游戏内验收。
 
 ### 阵营与出生动画
 
@@ -89,6 +98,10 @@ ForceAnimationPlayback(13000890, 20012, false, false, false);
 ```
 
 同时存在且需要分别控制的单位应使用不同 ID。同一角色集合内 ID 已被另一单位占用时，新单位的注册会被拒绝。原单位完成清理后可再次使用该 ID。
+
+### 动画渐隐渐出
+
+召唤单位的动画通知（TAE）与事件可以控制透明度及渲染状态。首次绑定和存活更新不会将透明度强制重置为 1，也不会在每次更新时强制恢复初始渲染状态。隐藏单位重新激活时，仅恢复 DLL 隐藏时改过的透明度字段；动画关键帧透明度继续由游戏控制。无需额外配置。此行为已通过自动回归测试，具体动画效果仍需游戏内确认。
 
 ### 其他全局设置
 

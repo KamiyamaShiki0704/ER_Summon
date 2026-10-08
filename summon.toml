@@ -8,9 +8,12 @@ unbound_timeout_ms = 2000
 # -1: no timeout; remove on death or vanish_request_speffect.
 # Nonnegative values: lifetime in milliseconds (0 retains the 1 ms minimum).
 fallback_lifetime_ms = -1
-# Position offsets use camera-local horizontal axes plus world height:
-# offset_forward: positive = toward the camera view direction, negative = backward
-# offset_right: positive = camera-right, negative = camera-left
+# camera: camera-horizontal axes; world: fixed +Z forward, +X right, +Y up.
+# Both modes add offsets to the player world position. Entries may override this.
+offset_space = "camera"
+# Position offsets use the selected horizontal axes plus world height:
+# offset_forward: camera-forward in camera mode; +Z in world mode
+# offset_right: camera-right in camera mode; +X in world mode
 # offset_up: positive = upward, negative = downward
 offset_forward = 2.8
 offset_right = 0.0
@@ -43,7 +46,7 @@ log_enabled = true
 # The following global fields can also be set inside a [[summons]] entry.
 # Entry values override the global value only for that summon:
 # marker_speffect, vanish_request_speffect, generated_team_type,
-# fallback_lifetime_ms, offset_forward, offset_right, offset_up,
+# fallback_lifetime_ms, offset_space, offset_forward, offset_right, offset_up,
 # disable_lock_on.
 
 # event_entity_id is the id event scripts use to find and control this summon.
@@ -71,6 +74,7 @@ is_player = false
 # vanish_request_speffect = 14200129
 # generated_team_type = 47
 # fallback_lifetime_ms = 10000
+# offset_space = "world"
 # offset_forward = 2.8
 # offset_right = -1.25
 # offset_up = 0.05
@@ -145,3 +149,19 @@ animation_id = 20018
 offset_right = 1.25
 is_player = false
 # event_entity_id = 42050006
+
+# c0000 humanoid NPC example (disabled). Choose an unused trigger before enabling.
+# Parameter IDs below come from the CT Patches preset; verify against your regulation.
+# Player creation type here means a humanoid NPC, not the local player.
+# [[summons]]
+# trigger_speffect = 3269
+# chr_id = 0
+# is_player = true  # selected automatically for chr_id = 0
+# chara_init_param_id = 23090
+# npc_param_id = 523090010
+# npc_think_param_id = 523090010
+# event_entity_id = 0
+# talk_id = 0
+# generated_team_type = 47
+# fallback_lifetime_ms = -1
+# animation_id = -1

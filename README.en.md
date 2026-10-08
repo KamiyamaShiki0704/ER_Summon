@@ -55,15 +55,24 @@ Each `[[summons]]` entry defines a summon type.
 | `event_entity_id` | Entity ID used by event scripts; 0 skips registration |
 | `animation_id` | Animation requested on activation; `-1` skips the spawn animation request |
 | `talk_id` / `is_player` | Talk ID and character creation type |
-| `offset_forward` | Camera-relative horizontal offset; positive is forward |
-| `offset_right` | Camera-relative horizontal offset; positive is right |
+| `offset_space` | `camera` uses camera-horizontal axes; `world` uses fixed world axes; defaults to `camera` |
+| `offset_forward` | Positive is camera-horizontal forward or world +Z |
+| `offset_right` | Positive is camera-horizontal right or world +X |
 | `offset_up` | World vertical offset; positive is upward |
 
-Entries can override the global `marker_speffect`, `vanish_request_speffect`, `generated_team_type`, `fallback_lifetime_ms`, all three position offsets, and `disable_lock_on`. Omitted overrides inherit the global value.
+Entries can override the global `marker_speffect`, `vanish_request_speffect`, `generated_team_type`, `fallback_lifetime_ms`, `offset_space`, all three position offsets, and `disable_lock_on`. Omitted overrides inherit the global value.
 
-Activated units face the player's current horizontal facing direction. Position offsets use the camera orientation and are calculated separately.
+Activated units face the player's current horizontal facing direction. Position offsets use the selected axes and are calculated separately.
+
+Set `offset_space = "camera"` globally or per entry for offsets that rotate with the camera. Set `offset_space = "world"` for fixed world axes: `offset_right` adds to X, `offset_up` adds to Y, and `offset_forward` adds to Z. Both modes start from the player's world position. World mode does not follow player facing or specify an absolute spawn position. Omitting the setting preserves camera mode.
 `disable_lock_on = true` disables lock-on for the entire summoned character.
 Legacy position names `spawn_forward_distance`, `side_offset`, and `spawn_height_offset` remain accepted. Do not specify both the old and new names for an axis in the same scope.
+
+### Humanoid NPCs (c0000)
+
+Use `chr_id = 0` for humanoid NPCs. The DLL automatically selects player-character creation without replacing the local player. Supply the target NPC's `chara_init_param_id` (equipment and appearance initialization), `npc_param_id`, and `npc_think_param_id`; these must be valid in your current regulation. You may explicitly set `is_player = true`; c0000 also selects this path when it is omitted.
+
+The bundled configuration includes a commented Patches preset from the CT. Check its parameter IDs against your regulation and choose an unused trigger before enabling it. Humanoid spawning, event control, and cleanup still require in-game acceptance.
 
 ### Team and spawn animation
 
@@ -89,6 +98,10 @@ ForceAnimationPlayback(13000890, 20012, false, false, false);
 ```
 
 Simultaneously active units that need separate control should use different IDs. Registration is refused if another character in the same character set already owns the ID. Once the original unit finishes cleanup, the ID can be used again.
+
+### Animation fades
+
+Animation notifies (TAE) and events can control summoned characters' transparency and rendering state. Initial binding and ongoing updates no longer force transparency to 1, and updates no longer restore the initial rendering state each time. Reactivating a hidden unit restores only transparency fields changed by the DLL while parking it; animation keyframe opacity stays under engine control. No additional configuration is needed. Automated regression checks pass; the visual effect of individual animations still requires in-game verification.
 
 ### Other global settings
 
