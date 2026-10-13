@@ -136,10 +136,16 @@ Release 静态链接 MSVC CRT，并保留调试信息。安装 Windows SDK 后�
 依赖由 Cargo 获取，固定到以下版本；首次构建需要网络连接：
 
 ```text
-https://github.com/KamiyamaShiki0704/fromsoftware-rs
-02fa5681e27fd2ecd9da79d34aef9fae96805539
+https://github.com/KamiyamaShiki0704/ShikiFSRS
+930f818431e72209b49d2e37265a1f8150fa5390
 ```
 
 ## 许可与致谢
 
-使用 MIT 或 Apache-2.0 许可。运行时绑定基于 [fromsoftware-rs](https://github.com/vswarte/fromsoftware-rs)，依赖保留各自的许可条款。
+使用 MIT 或 Apache-2.0 许可。运行时接口使用独立实现的 [ShikiFSRS](https://github.com/KamiyamaShiki0704/ShikiFSRS)，依赖保留各自的许可条款。
+
+## Building with private ShikiFSRS
+
+Cargo pins `KamiyamaShiki0704/ShikiFSRS` to `930f818431e72209b49d2e37265a1f8150fa5390`. This SDK repository is private: the build account needs repository read access and Git credentials. `.cargo/config.toml` enables Git CLI fetching; no token is stored in this repository.
+
+The migration was checked offline against ER WW 1.17.1 (EXE 2.7.1.0). Native engine ownership, phase/lifetime requirements and unexecuted gameplay behavior remain experimental and require manual acceptance. Existing ignored game/asset fixtures were not executed.

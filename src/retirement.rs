@@ -1,21 +1,27 @@
-//! Deferred lifetime retirement: detach first, observe native readers drain,
-//! then destroy only from FrameEnd. Raw addresses remain owned by this queue.
-use eldenring::cs::{ChrIns, FieldInsHandle, WorldChrMan};
-use std::sync::Mutex;
-use windows::Win32::System::Memory::{
-    MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+//! Explicit FrameEnd ownership retirement. Known-reader drain is advisory, not authority.
+use shikifsrs_elden_ring::{
+    character_handles::PrimaryPlayerTargetClear,
+    character_sets::{CharacterIdentity, CharacterRegistrationObservation},
+    current_character_events::{CurrentCharacterEvents, EventEntityRelease},
+    current_character_lifecycle::{
+        CharacterRetirementObservation, CurrentCharacterLifecycle, NativeCharacterDestruction,
+        NativeCharacterDetach, NativeCharacterOwnerQuery,
+    },
+    current_character_tasks::{CharacterTaskClear, CurrentCharacterTasks},
+    current_control_links::CurrentControlLinks,
 };
-
-pub(crate) const TASK_OFFSETS: [usize; 6] = [0x418, 0x448, 0x478, 0x4a8, 0x4d8, 0x508];
-pub(crate) const VECTOR_OFFSETS: [usize; 3] = [0x1f1b0, 0x1f1d0, 0x1f200];
-
+use shikifsrs_runtime::{Error, Result};
+use std::{sync::Arc, time::Instant};
+pub fn accepts_frame_end(group: u32) -> bool {
+    matches!(group, 168 | 0x9000_00a8)
+}
 #[derive(Default)]
-pub(crate) struct DrainGate {
+pub struct DrainGate {
     quiet_frames: u8,
 }
 impl DrainGate {
-    fn observe(&mut self, references: Option<usize>, proxies_clear: bool) -> bool {
-        if references != Some(0) || !proxies_clear {
+    pub fn observe(&mut self, references: Option<usize>, clear: bool) -> bool {
+        if references != Some(0) || !clear {
             self.quiet_frames = 0;
             return false;
         }
@@ -23,201 +29,365 @@ impl DrainGate {
         self.quiet_frames >= 2
     }
 }
-
-pub(crate) struct Retired {
-    pub world: usize,
-    pub player: usize,
-    pub character: usize,
-    pub owner: usize,
-    pub destructor: usize,
-    pub handle: FieldInsHandle,
-    pub gate: DrainGate,
-    pub last_observation: Option<(Option<usize>, bool)>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    Prepare,
+    Selection,
+    Aliases,
+    ClearTask(usize),
+    Detach,
+    Destroy,
+    Free,
 }
-static QUEUE: Mutex<Vec<Retired>> = Mutex::new(Vec::new());
-
-pub(crate) fn pending() -> bool {
-    QUEUE.lock().map_or(true, |q| !q.is_empty())
+pub trait Driver {
+    fn perform(&mut self, step: Step) -> Result<()>;
+    fn observe(&mut self) -> Result<(usize, bool)>;
 }
-pub(crate) fn enqueue(value: Retired) {
-    // Poisoning is not recoverable by freeing a potentially live engine object.
-    if let Ok(mut queue) = QUEUE.lock() {
-        queue.push(value);
+#[derive(Default)]
+pub struct Protocol {
+    next: usize,
+    pub failure: Option<Error>,
+    gate: DrainGate,
+    pub complete: bool,
+}
+impl Protocol {
+    /// Publish the actual native driver record before advancing. Failure blocks all retries.
+    pub fn advance(&mut self, driver: &mut impl Driver) -> Result<()> {
+        if let Some(e) = &self.failure {
+            return Err(e.clone());
+        }
+        if self.complete {
+            return Ok(());
+        }
+        let result: Result<()> = (|| {
+            while self.next < 10 {
+                let step = match self.next {
+                    0 => Step::Prepare,
+                    1 => Step::Selection,
+                    2 => Step::Aliases,
+                    3..=8 => Step::ClearTask(self.next - 3),
+                    _ => Step::Detach,
+                };
+                driver.perform(step)?;
+                self.next += 1;
+            }
+            if self.next == 10 {
+                let (refs, clear) = driver.observe()?;
+                if !self.gate.observe(Some(refs), clear) {
+                    return Ok(());
+                }
+                // Additional guard only: native destruction still requires independent complete quiescence.
+                driver.perform(Step::Destroy)?;
+                self.next += 1;
+            }
+            if self.next == 11 {
+                driver.perform(Step::Free)?;
+                self.next += 1;
+            }
+            self.complete = true;
+            Ok(())
+        })();
+        if let Err(e) = &result {
+            self.failure = Some(e.clone())
+        }
+        result
     }
 }
-
-/// World transitions can invalidate resources even when this allocation was
-/// detached. Leak quarantined storage rather than invoking a stale destructor.
-pub(crate) fn quarantine_all(reason: &str) {
-    if let Ok(mut queue) = QUEUE.lock() {
-        if !queue.is_empty() {
-            crate::log_line(format_args!(
-                "summon retirement: phase=quarantined count={} reason={reason}; allocations retained until process exit",
-                queue.len()
-            ));
-            queue.clear();
+#[derive(Clone, Copy)]
+pub struct Request {
+    pub actor: CharacterRegistrationObservation,
+    pub primary: CharacterIdentity,
+    pub not_before: Instant,
+}
+pub struct NativeRecord {
+    pub request: Request,
+    pub owner_query: Option<NativeCharacterOwnerQuery>,
+    pub selection: Option<PrimaryPlayerTargetClear>,
+    pub aliases: Option<EventEntityRelease>,
+    pub tasks: Vec<CharacterTaskClear>,
+    pub detach: Option<NativeCharacterDetach>,
+    pub last_observation: Option<CharacterRetirementObservation>,
+    pub destruction: Option<NativeCharacterDestruction>,
+    pub free: Option<Result<()>>,
+}
+impl NativeRecord {
+    pub fn new(request: Request) -> Self {
+        Self {
+            request,
+            owner_query: None,
+            selection: None,
+            aliases: None,
+            tasks: Vec::with_capacity(6),
+            detach: None,
+            last_observation: None,
+            destruction: None,
+            free: None,
+        }
+    }
+    pub fn quarantine(&mut self) {
+        if let Some(query) = &mut self.owner_query
+            && let Ok(ticket) = &mut query.prepared
+        {
+            ticket.quarantine()
         }
     }
 }
-
-pub(crate) fn player_address(world: &WorldChrMan) -> usize {
-    world
-        .main_player
-        .as_ref()
-        .map_or(0, |p| p.as_ref() as *const _ as usize)
+pub struct NativeAccess {
+    pub lifecycle: CurrentCharacterLifecycle,
+    pub events: CurrentCharacterEvents,
+    pub tasks: CurrentCharacterTasks,
+    pub links: CurrentControlLinks,
+    limit: usize,
 }
-
-fn readable(address: usize, size: usize) -> bool {
-    if address == 0 {
-        return false;
-    }
-    let mut region = MEMORY_BASIC_INFORMATION::default();
-    (unsafe {
-        VirtualQuery(
-            Some(address as *const _),
-            &mut region,
-            std::mem::size_of_val(&region),
-        )
-    }) != 0
-        && region.State == MEM_COMMIT
-        && region.Protect.0 & (PAGE_GUARD.0 | PAGE_NOACCESS.0) == 0
-        && address.checked_add(size).is_some_and(|end| {
-            (region.BaseAddress as usize)
-                .checked_add(region.RegionSize)
-                .is_some_and(|limit| end <= limit)
-        })
-}
-
-fn word(address: usize) -> Option<usize> {
-    readable(address, 8).then(|| unsafe { (address as *const usize).read_unaligned() })
-}
-
-fn count_vector(world: usize, offset: usize, stride: usize, pointer: usize) -> Option<usize> {
-    let first = word(world + offset + 8)?;
-    let last = word(world + offset + 16)?;
-    let end = word(world + offset + 24)?;
-    let bytes = last.checked_sub(first)?;
-    if last > end || bytes % stride != 0 || bytes / stride > 65536 {
-        return None;
-    }
-    if bytes == 0 {
-        return Some(0);
-    }
-    if !readable(first, bytes) {
-        return None;
-    }
-    Some(
-        (0..bytes / stride)
-            .filter(|i| unsafe {
-                ((first + i * stride) as *const usize).read_unaligned() == pointer
+impl NativeAccess {
+    /// # Safety
+    /// Each SDK's full graph/phase/heap/ownership/residency contract holds. In particular,
+    /// complete reader/task quiescence is an experimental live-host obligation, never acquired here.
+    pub unsafe fn bind(bytes: Arc<[u8]>, base: u64, epoch: u64) -> Result<Self> {
+        unsafe {
+            Ok(Self {
+                lifecycle: CurrentCharacterLifecycle::bind(bytes.clone(), base, epoch, None)?,
+                events: CurrentCharacterEvents::bind(bytes.clone(), base, epoch, None)?,
+                tasks: CurrentCharacterTasks::bind(bytes.clone(), base, epoch)?,
+                links: CurrentControlLinks::bind(bytes, base, epoch, None)?,
+                limit: 65536,
             })
-            .count(),
-    )
-}
-
-fn references(world: usize, pointer: usize) -> Option<usize> {
-    let mut count = 0;
-    for (offset, stride) in VECTOR_OFFSETS.into_iter().zip([8, 16, 8]) {
-        count += count_vector(world, offset, stride, pointer)?;
-    }
-    // WorldChrMan_PostPhysics also traverses this (character,next) chain.
-    let mut node = word(world + 0x1e6a8)?;
-    let mut visited = 0;
-    while node != 0 {
-        if visited >= 65536 {
-            return None;
         }
-        count += usize::from(word(node)? == pointer);
-        node = word(node + 8)?;
-        visited += 1;
     }
-    Some(count)
 }
-
-/// Must only be called by the FrameEnd callback, after native frame work.
-/// No shared engine list is edited; the engine rebuilds lists after detachment.
-pub(crate) fn poll(world: &mut WorldChrMan) {
-    let Ok(mut queue) = QUEUE.lock() else {
-        return;
-    };
-    let current_world = world as *mut _ as usize;
-    let current_player = player_address(world);
-    let mut i = 0;
-    while i < queue.len() {
-        let item = &mut queue[i];
-        // Do not dereference an orphan after a world/player transition. Keep its
-        // storage quarantined rather than risking a second free during teardown.
-        if item.world != current_world || item.player != current_player || current_player == 0 {
-            crate::log_line(format_args!(
-                "summon retirement: handle={} phase=quarantined reason=world-or-player-changed; allocation retained until process exit",
-                item.handle
-            ));
-            queue.swap_remove(i);
-            continue;
+pub struct NativeDriver<'a> {
+    pub access: &'a NativeAccess,
+    pub record: &'a mut NativeRecord,
+}
+impl Driver for NativeDriver<'_> {
+    fn perform(&mut self, step: Step) -> Result<()> {
+        let access = self.access;
+        let record = &mut self.record;
+        let actor = record.request.actor;
+        // SAFETY: The resident FrameEnd host owes all transitive SDK obligations and complete
+        // quiescence. Neither these receipts nor the copied reader subset proves them.
+        unsafe {
+            match step {
+                Step::Prepare => {
+                    record.owner_query = Some(access.lifecycle.prepare(actor, access.limit)?);
+                    record
+                        .owner_query
+                        .as_ref()
+                        .expect("published query")
+                        .prepared
+                        .as_ref()
+                        .map(|_| ())
+                        .map_err(Clone::clone)
+                }
+                Step::Selection => {
+                    let source = access.links.observe_primary_target()?.ok_or(
+                        Error::NativeOperationRejected("primary selection unavailable"),
+                    )?;
+                    if source.player != record.request.primary {
+                        return Err(Error::NativeOperationRejected("retirement primary changed"));
+                    }
+                    record.selection =
+                        Some(access.links.clear_primary_target(source, actor.character)?);
+                    record
+                        .selection
+                        .as_ref()
+                        .expect("published selection")
+                        .postflight
+                        .as_ref()
+                        .map(|_| ())
+                        .map_err(Clone::clone)
+                }
+                Step::Aliases => {
+                    let source = access.events.observe(actor, access.limit)?.ok_or(
+                        Error::NativeOperationRejected("retirement mappings unavailable"),
+                    )?;
+                    record.aliases =
+                        Some(access.events.release_entity_aliases(source, access.limit)?);
+                    record
+                        .aliases
+                        .as_ref()
+                        .expect("published aliases")
+                        .after
+                        .as_ref()
+                        .map(|_| ())
+                        .map_err(Clone::clone)
+                }
+                Step::ClearTask(ordinal) => {
+                    let receipt = access.tasks.clear(actor.character, ordinal as u8)?;
+                    let result = match &receipt {
+                        CharacterTaskClear::AlreadyClear => Ok(()),
+                        CharacterTaskClear::Requested { slot_clear, .. } => slot_clear.clone(),
+                    };
+                    record.tasks.push(receipt);
+                    result
+                }
+                Step::Detach | Step::Destroy | Step::Free => {
+                    let ticket = record
+                        .owner_query
+                        .as_mut()
+                        .ok_or(Error::InvalidProfile("missing owner query"))?
+                        .prepared
+                        .as_mut()
+                        .map_err(|e| e.clone())?;
+                    match step {
+                        Step::Detach => {
+                            record.detach = Some(access.lifecycle.detach(ticket, access.limit)?);
+                            record
+                                .detach
+                                .as_ref()
+                                .expect("published detach")
+                                .postflight
+                                .clone()
+                        }
+                        Step::Destroy => {
+                            record.destruction = Some(
+                                access
+                                    .lifecycle
+                                    .destroy_without_free(ticket, access.limit)?,
+                            );
+                            let receipt =
+                                record.destruction.as_ref().expect("published destructor");
+                            receipt.postflight.clone()?;
+                            if let Some(pool) = &receipt.npc_pool_after {
+                                pool.as_ref().map_err(Clone::clone)?;
+                            }
+                            Ok(())
+                        }
+                        Step::Free => {
+                            let result = access.lifecycle.release_storage(ticket);
+                            record.free = Some(result.clone());
+                            result
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            }
         }
-        let refs = references(current_world, item.character);
-        let proxies_clear = TASK_OFFSETS
+    }
+    fn observe(&mut self) -> Result<(usize, bool)> {
+        let ticket = self
+            .record
+            .owner_query
+            .as_ref()
+            .ok_or(Error::InvalidProfile("missing retirement ticket"))?
+            .prepared
+            .as_ref()
+            .map_err(Clone::clone)?;
+        let observed = self
+            .access
+            .lifecycle
+            .observe_retirement(ticket, self.access.limit)?;
+        let refs = usize::from(observed.references.primary_slot_matches)
+            + observed
+                .references
+                .collections
+                .iter()
+                .map(|v| v.matches)
+                .sum::<usize>();
+        let clear = observed
+            .tasks
+            .tasks
             .iter()
-            .all(|offset| word(item.character + offset + 0x10) == Some(0));
-        let observation = (refs, proxies_clear);
-        if item.last_observation != Some(observation) {
-            crate::log_line(format_args!(
-                "summon retirement: handle={} phase=draining references={refs:?} task_proxies_clear={proxies_clear}",
-                item.handle
-            ));
-            item.last_observation = Some(observation);
-        }
-        if !item.gate.observe(refs, proxies_clear) {
-            i += 1;
-            continue;
-        }
-        let item = queue.swap_remove(i);
-        crate::log_line(format_args!(
-            "summon retirement: handle={} phase=before-destructor character={:#x} quiet_frame_ends=2",
-            item.handle, item.character
-        ));
-        // The lookup and both vtables were verified before detaching ownership.
-        let destructor: unsafe extern "C" fn(*mut ChrIns, u32) =
-            unsafe { std::mem::transmute(item.destructor) };
-        let owner = unsafe { &*(item.owner as *const eldenring::dlkr::DLAllocator) };
-        crate::chr_lifecycle::teardown_with_owner(
-            |delete| unsafe { destructor(item.character as *mut ChrIns, delete as u32) },
-            || (owner.vftable.deallocate)(owner, item.character as *const u8),
-        );
-        // The slot was detached earlier and may now be reused; NEVER clear it here.
-        crate::log_line(format_args!(
-            "summon removed: handle={} outcome=destroyed retirement=frame-end-drained",
-            item.handle
-        ));
+            .all(|v| v.registration.is_none());
+        self.record.last_observation = Some(observed);
+        Ok((refs, clear))
     }
 }
-
+pub struct Pending {
+    pub record: NativeRecord,
+    pub protocol: Protocol,
+}
+impl Pending {
+    pub fn new(request: Request) -> Self {
+        Self {
+            record: NativeRecord::new(request),
+            protocol: Protocol::default(),
+        }
+    }
+    pub fn advance(&mut self, access: &NativeAccess) -> Result<()> {
+        self.protocol.advance(&mut NativeDriver {
+            access,
+            record: &mut self.record,
+        })
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct Mock {
+        calls: Vec<Step>,
+        fail: Option<usize>,
+        observations: Vec<(usize, bool)>,
+    }
+    impl Driver for Mock {
+        fn perform(&mut self, step: Step) -> Result<()> {
+            self.calls.push(step);
+            if self.fail == Some(self.calls.len() - 1) {
+                Err(Error::NativeOperationRejected("postflight"))
+            } else {
+                Ok(())
+            }
+        }
+        fn observe(&mut self) -> Result<(usize, bool)> {
+            Ok(self.observations.remove(0))
+        }
+    }
     #[test]
     fn stale_reader_blocks_free_until_two_quiet_frame_ends() {
         let mut gate = DrainGate::default();
-        assert!(!gate.observe(Some(1), true)); // exact failure pattern: old list owns pointer
-        assert!(!gate.observe(Some(0), false)); // still registered task
-        assert!(!gate.observe(Some(0), true));
-        assert!(!gate.observe(None, true)); // failed observation resets progress
-        assert!(!gate.observe(Some(0), true));
+        for (refs, clear) in [
+            (Some(1), true),
+            (Some(0), false),
+            (Some(0), true),
+            (None, true),
+            (Some(0), true),
+        ] {
+            assert!(!gate.observe(refs, clear))
+        }
         assert!(gate.observe(Some(0), true));
     }
     #[test]
-    fn bound_world_vectors_match_native_consumers() {
-        assert_eq!(
-            std::mem::offset_of!(WorldChrMan, chr_inses_by_distance),
-            0x1f1d0
-        );
-        assert_eq!(
-            std::mem::offset_of!(WorldChrMan, chr_inses_by_update_priority),
-            0x1f200
-        );
-        assert_eq!(
-            std::mem::size_of::<eldenring::cs::ChrInsDistanceEntry>(),
-            16
-        );
+    fn cancellation_detach_destruction_and_original_allocator_are_ordered() {
+        let mut driver = Mock {
+            calls: Vec::new(),
+            fail: None,
+            observations: vec![(0, true); 2],
+        };
+        let mut protocol = Protocol::default();
+        protocol.advance(&mut driver).unwrap();
+        assert_eq!(driver.calls.last(), Some(&Step::Detach));
+        assert!(!protocol.complete);
+        protocol.advance(&mut driver).unwrap();
+        assert_eq!(&driver.calls[10..], &[Step::Destroy, Step::Free]);
+        assert!(protocol.complete);
+        protocol.advance(&mut driver).unwrap();
+        assert_eq!(driver.calls.len(), 12);
+    }
+    #[test]
+    fn every_partial_attempt_blocks_retry_and_later_free() {
+        for fail in 0..12 {
+            let mut driver = Mock {
+                calls: Vec::new(),
+                fail: Some(fail),
+                observations: vec![(0, true); 2],
+            };
+            let mut protocol = Protocol::default();
+            if protocol.advance(&mut driver).is_ok() {
+                assert!(protocol.advance(&mut driver).is_err())
+            }
+            let count = driver.calls.len();
+            assert_eq!(count, fail + 1);
+            assert!(protocol.advance(&mut driver).is_err());
+            assert_eq!(driver.calls.len(), count);
+            assert!(!protocol.complete);
+        }
+    }
+    #[test]
+    fn accepts_observed_frame_end_id_but_rejects_other_groups() {
+        assert!(accepts_frame_end(2415919272));
+        assert!(accepts_frame_end(168));
+        for group in [0, 167, 169, 0x900000a7, 0x900000a9, 0x800000a8, u32::MAX] {
+            assert!(!accepts_frame_end(group))
+        }
     }
 }

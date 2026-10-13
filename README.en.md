@@ -136,10 +136,10 @@ Release builds statically link the MSVC CRT and retain debug information. With t
 Cargo fetches the dependencies at this pinned revision; the first build requires network access:
 
 ```text
-https://github.com/KamiyamaShiki0704/fromsoftware-rs
-02fa5681e27fd2ecd9da79d34aef9fae96805539
+https://github.com/KamiyamaShiki0704/ShikiFSRS
+930f818431e72209b49d2e37265a1f8150fa5390
 ```
 
 ## License and acknowledgements
 
-Licensed under MIT or Apache-2.0. Runtime bindings are based on [fromsoftware-rs](https://github.com/vswarte/fromsoftware-rs). Dependencies retain their own license terms.
+Licensed under MIT or Apache-2.0. Runtime interfaces use the independently implemented [ShikiFSRS](https://github.com/KamiyamaShiki0704/ShikiFSRS). Dependencies retain their own license terms.

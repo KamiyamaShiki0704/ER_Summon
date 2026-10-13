@@ -87,7 +87,8 @@ fn find_rc() -> Option<PathBuf> {
         let Some(root) = env::var_os(key) else {
             continue;
         };
-        let Ok(entries) = fs::read_dir(Path::new(&root).join("Windows Kits").join("10").join("bin"))
+        let Ok(entries) =
+            fs::read_dir(Path::new(&root).join("Windows Kits").join("10").join("bin"))
         else {
             continue;
         };

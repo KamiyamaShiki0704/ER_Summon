@@ -1,6 +1,10 @@
-mod chr_lifecycle;
+mod creation;
+mod host;
+#[cfg(test)]
+mod native_guards;
+mod presentation;
 mod retirement;
-
+use serde::Deserialize;
 use std::{
     ffi::{OsString, c_void},
     fs,
@@ -8,73 +12,29 @@ use std::{
     os::windows::ffi::OsStringExt,
     path::{Path, PathBuf},
     sync::{
-        LazyLock, Mutex, Once, OnceLock,
-        atomic::{AtomicIsize, AtomicU32, AtomicU64, Ordering},
+        LazyLock, Mutex, OnceLock,
+        atomic::{AtomicIsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
 };
-
-use chr_lifecycle::{
-    DestroyOutcome, EntityIdOutcome, character_reports_event_entity_id, chr_set_usage,
-    destroy_summon, entity_id_owner, register_event_entity_id, release_summon_event_ids,
-};
-
-use eldenring::{
-    cs::{
-        BlockId, CSCamExt, CSCamera, CSTaskGroupIndex, CSTaskImp, ChrIns, ChrInsExt,
-        FieldInsHandle, FieldInsSelector, WorldChrMan,
-    },
-    fd4::FD4TaskData,
-    position::HavokPosition,
-    rotation::Quaternion,
-    util::system::wait_for_system_init,
-};
-use fromsoftware_shared::{
-    F32Vector4, FromStatic, GameVersion, LANG_ID_EN, LANG_ID_JP, SharedTaskImpExt, program::Program,
-};
-use serde::Deserialize;
 use windows::Win32::{
     Foundation::{HINSTANCE, HMODULE},
     System::LibraryLoader::GetModuleFileNameW,
 };
-
-const DLL_PROCESS_ATTACH: u32 = 1;
+use windows::core::BOOL;
 const CONFIG_FILE_NAME: &str = "summon.toml";
 const LOG_FILE_NAME: &str = "summon.log";
-const DEBUG_CREATOR_INIT_DATA_SIZE: usize = 0x100;
-const DEBUG_CREATOR_SPAWN_ROTATION_OFFSET: usize = 0x10;
-const DEBUG_CREATOR_ENEMY_TYPE_OFFSET: usize = 0xc8;
-
-static INSTALL_TASKS: Once = Once::new();
 static DLL_MODULE: AtomicIsize = AtomicIsize::new(0);
 static SETTINGS: OnceLock<AttackSummonSettings> = OnceLock::new();
 static LOG: LazyLock<Mutex<Option<fs::File>>> = LazyLock::new(|| Mutex::new(None));
-static STATE: LazyLock<Mutex<AttackSummonState>> =
-    LazyLock::new(|| Mutex::new(AttackSummonState::default()));
-// Temporary, bounded diagnostics for the stalled FrameEnd path. These counters
-// observe dispatch only; they must never authorize destruction on another group.
-static RETIREMENT_CALLBACKS: AtomicU64 = AtomicU64::new(0);
-static RETIREMENT_ACCEPTED: AtomicU64 = AtomicU64::new(0);
-static RETIREMENT_GROUP: AtomicU32 = AtomicU32::new(u32::MAX);
-static RETIREMENT_STATUS: AtomicU32 = AtomicU32::new(0);
-static RETIREMENT_REPORT_AT: Mutex<Option<Instant>> = Mutex::new(None);
-
-/// Appends a line to `summon.log` next to the DLL.
-///
-/// Logging exists so the lifecycle claims shipped with this mod are verifiable in
-/// a live session without a debugger: every bind reports the entity id the engine
-/// and this DLL settled on, and every removal reports whether the character set
-/// entry was actually released.
 pub(crate) fn log_line(message: impl std::fmt::Display) {
     if !settings().log_enabled {
         return;
     }
-    let Ok(mut guard) = LOG.lock() else {
-        return;
-    };
+    let Ok(mut guard) = LOG.lock() else { return };
     if guard.is_none() {
-        let Some(path) = module_dir().map(|dir| dir.join(LOG_FILE_NAME)) else {
+        let Some(path) = module_dir().map(|d| d.join(LOG_FILE_NAME)) else {
             return;
         };
         *guard = fs::OpenOptions::new()
@@ -88,267 +48,33 @@ pub(crate) fn log_line(message: impl std::fmt::Display) {
         let _ = file.flush();
     }
 }
-
-#[unsafe(no_mangle)]
 /// # Safety
-pub unsafe extern "C" fn DllMain(hmodule: HINSTANCE, reason: u32, _: *mut c_void) -> i32 {
-    DLL_MODULE.store(hmodule.0 as isize, Ordering::Relaxed);
-    if reason != DLL_PROCESS_ATTACH {
-        return 1;
-    }
-
-    thread::spawn(|| {
-        thread::sleep(settings().start_delay());
-        let program = Program::current();
-        if supported_executable(program) && wait_for_system_init(&program, Duration::MAX).is_ok() {
-            install_tasks_once();
-        }
-    });
-
-    1
-}
-
-#[derive(Clone, Copy)]
-enum SupportedErVersion {
-    Ww2700,
-    Ww2710,
-    Jp2701,
-}
-
-impl GameVersion for SupportedErVersion {
-    const NAME: &'static str = "elden ring";
-
-    fn from_lang_version(lang_id: u16, version: &str) -> Option<Self> {
-        match (lang_id, version) {
-            (LANG_ID_EN, "2.7.0.0") => Some(Self::Ww2700),
-            (LANG_ID_EN, "2.7.1.0") => Some(Self::Ww2710),
-            (LANG_ID_JP, "2.7.0.1") => Some(Self::Jp2701),
-            _ => None,
-        }
-    }
-}
-
-fn supported_executable(program: Program<'_>) -> bool {
-    let Program::Mapping(module) = program else {
-        return false;
-    };
-    SupportedErVersion::detect(&module).is_ok()
-}
-
-fn install_tasks_once() {
-    INSTALL_TASKS.call_once(|| {
-        let Ok(task_imp) = CSTaskImp::wait_for_instance(Duration::from_secs(30)) else {
-            return;
-        };
-
-        let attack_summon = task_imp.run_recurring(
-            attack_summon_task as fn(&FD4TaskData),
-            CSTaskGroupIndex::ChrIns_PostPhysics,
-        );
-        std::mem::forget(attack_summon);
-        let retirement_task = task_imp.run_recurring(
-            retirement_frame_end as fn(&FD4TaskData), CSTaskGroupIndex::FrameEnd,
-        );
-        std::mem::forget(retirement_task);
-
-        let settings = settings();
-        log_line(format_args!(
-            "summon initialised: retirement=frame-end-v3 entity_registration=native-groups-v1 remove_mode={:?} register_event_entity_id={} \
-             effective_reuse={} destroy_delay_ms={} summons={}",
-            settings.remove_mode,
-            settings.register_event_entity_id,
-            settings.reuses_units(),
-            settings.destroy_delay_ms,
-            settings.summons.len(),
-        ));
-    });
-}
-
-fn is_retirement_frame_end(group: u32) -> bool {
-    // Registration takes an ordinal, but the pinned WW2.7.1.0 game supplies
-    // 0x900000A8 to this FrameEnd callback (diag1 live evidence). Accept only
-    // that observed encoding and the plain ordinal; do not broadly mask bits
-    // whose meaning has not been established for other scheduler groups.
-    group == CSTaskGroupIndex::FrameEnd as u32 || group == 0x9000_00a8
-}
-
-#[cfg(test)]
-mod retirement_dispatch_tests {
-    #[test]
-    fn accepts_observed_frame_end_id_but_rejects_other_groups() {
-        // Exact FD4TaskData value from the failed diag1 live session.
-        assert!(super::is_retirement_frame_end(2_415_919_272));
-        assert!(super::is_retirement_frame_end(168));
-        for group in [0, 167, 169, 0x9000_00a7, 0x9000_00a9, 0x8000_00a8, u32::MAX] {
-            assert!(!super::is_retirement_frame_end(group));
-        }
-    }
-}
-
-fn retirement_frame_end(data: &FD4TaskData) {
-    let first = RETIREMENT_CALLBACKS.fetch_add(1, Ordering::Relaxed) == 0;
-    RETIREMENT_GROUP.store(data.task_group_id, Ordering::Relaxed);
-    if first {
-        log_line(format_args!(
-            "[DEBUG-retirement-dispatch] first-callback observed_group={} expected_group={}",
-            data.task_group_id, CSTaskGroupIndex::FrameEnd as u32
-        ));
-    }
-    if !is_retirement_frame_end(data.task_group_id) {
-        RETIREMENT_STATUS.store(1, Ordering::Relaxed);
-        return;
-    }
-    RETIREMENT_ACCEPTED.fetch_add(1, Ordering::Relaxed);
-    let Ok(world) = (unsafe { WorldChrMan::instance_mut() }) else {
-        RETIREMENT_STATUS.store(2, Ordering::Relaxed);
-        return;
-    };
-    if world.main_player.is_none() {
-        RETIREMENT_STATUS.store(3, Ordering::Relaxed);
-        retirement::quarantine_all("player-unavailable");
-        return;
-    }
-    let Ok(mut state) = STATE.lock() else {
-        RETIREMENT_STATUS.store(4, Ordering::Relaxed);
-        return;
-    };
-    RETIREMENT_STATUS.store(5, Ordering::Relaxed);
-    retirement::poll(world);
-    state.finish_pending_destruction(world, Instant::now());
-    RETIREMENT_STATUS.store(6, Ordering::Relaxed);
-}
-
-fn attack_summon_task(_: &FD4TaskData) {
-    let settings = settings();
-    let Ok(world_chr_man) = (unsafe { WorldChrMan::instance_mut() }) else {
-        retirement::quarantine_all("world-unavailable");
-        if let Ok(mut state) = STATE.lock() {
-            state.summons.clear();
-        }
-        return;
-    };
-
-    let now = Instant::now();
-    let Ok(mut state) = STATE.lock() else {
-        return;
-    };
-
-    state.ensure_trigger_slots(settings.summons.len());
-    state.update_existing(world_chr_man, now, settings);
-    let staged = state.summons.iter().filter(|s| s.destroy_at.is_some()).count();
-    if staged > 0 {
-        if let Ok(mut report_at) = RETIREMENT_REPORT_AT.lock() {
-            if report_at.is_none_or(|at| now >= at) {
-                *report_at = Some(now + Duration::from_secs(5));
-                log_line(format_args!(
-                    "[DEBUG-retirement-dispatch] staged={} callbacks={} accepted={} observed_group={} expected_group={} status={} (0=not-called,1=group-rejected,2=no-world,3=no-player,4=lock-poisoned,5=processing,6=completed)",
-                    staged, RETIREMENT_CALLBACKS.load(Ordering::Relaxed),
-                    RETIREMENT_ACCEPTED.load(Ordering::Relaxed),
-                    RETIREMENT_GROUP.load(Ordering::Relaxed), CSTaskGroupIndex::FrameEnd as u32,
-                    RETIREMENT_STATUS.load(Ordering::Relaxed),
-                ));
+/// Windows loader supplies the process module and standard loader arguments. Actual game
+/// registration runs outside loader lock; the resident SDK pins all installed callbacks.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn DllMain(module: HINSTANCE, reason: u32, _: *mut c_void) -> BOOL {
+    if reason == 1 {
+        DLL_MODULE.store(module.0 as isize, Ordering::Relaxed);
+        thread::spawn(|| {
+            thread::sleep(settings().start_delay());
+            if let Err(e) = host::install() {
+                log_line(format_args!("summon install rejected: {e}"));
             }
-        }
+        });
     }
-
-    let Some((player_pos, player_yaw, triggers)) = consume_player_triggers(world_chr_man, settings)
-    else {
-        state.release_all(world_chr_man, settings);
-        return;
-    };
-    if triggers.is_empty() || retirement::pending() {
-        return;
-    }
-
-    let (forward, right) = camera_horizontal_axes();
-    for config_index in triggers {
-        if state.active_count() >= settings.max_active_summons {
-            break;
-        }
-        if !state.accept_trigger(config_index, now, settings) {
-            continue;
-        }
-        state.activate_or_spawn(
-            world_chr_man,
-            config_index,
-            now,
-            player_pos,
-            player_yaw,
-            forward,
-            right,
-            settings,
-        );
-    }
+    BOOL(1)
 }
-
-fn consume_player_triggers(
-    world_chr_man: &mut WorldChrMan,
-    settings: &AttackSummonSettings,
-) -> Option<(HavokPosition, f32, Vec<usize>)> {
-    let player = world_chr_man.main_player.as_mut()?;
-    let active_effects = player
-        .chr_ins
-        .special_effect
-        .entries()
-        .map(|entry| entry.param_id)
-        .collect::<Vec<_>>();
-
-    let triggers = settings
-        .summons
-        .iter()
-        .enumerate()
-        .filter_map(|(index, config)| {
-            active_effects
-                .contains(&config.trigger_speffect)
-                .then_some(index)
-        })
-        .collect::<Vec<_>>();
-
-    for index in &triggers {
-        player
-            .chr_ins
-            .remove_speffect(settings.summons[*index].trigger_speffect);
-    }
-
-    let physics = player.chr_ins.modules.as_ref().physics.as_ref();
-    Some((
-        physics.position,
-        yaw_from_orientation(physics.orientation),
-        triggers,
-    ))
+#[derive(Clone, Copy)]
+struct HavokPosition(f32, f32, f32, f32);
+fn yaw_from_orientation([qx, qy, qz, qw]: [f32; 4]) -> f32 {
+    let x = 2.0 * (qx * qz + qw * qy);
+    let z = 1.0 - 2.0 * (qx * qx + qy * qy);
+    x.atan2(z)
 }
-
-fn yaw_from_orientation(Quaternion(qx, qy, qz, qw): Quaternion) -> f32 {
-    let forward_x = 2.0 * (qx * qz + qw * qy);
-    let forward_z = 1.0 - 2.0 * (qx * qx + qy * qy);
-    forward_x.atan2(forward_z)
-}
-
-fn camera_horizontal_axes() -> ((f32, f32, f32), (f32, f32, f32)) {
-    let Ok(camera) = (unsafe { CSCamera::instance() }) else {
-        return ((0.0, 0.0, 1.0), (1.0, 0.0, 0.0));
-    };
-
-    let forward = camera.pers_cam_1.forward();
-    let right = camera.pers_cam_1.right();
-    (
-        normalize_horizontal((forward.0, forward.1, forward.2), (0.0, 0.0, 1.0)),
-        normalize_horizontal((right.0, right.1, right.2), (1.0, 0.0, 0.0)),
-    )
-}
-
-fn normalize_horizontal(vector: (f32, f32, f32), fallback: (f32, f32, f32)) -> (f32, f32, f32) {
-    let len = (vector.0 * vector.0 + vector.2 * vector.2).sqrt();
-    if len <= 0.001 || !len.is_finite() {
-        return fallback;
-    }
-    (vector.0 / len, 0.0, vector.2 / len)
-}
-
 /// What happens to a summon that has to disappear.
 #[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
-enum RemoveMode {
+pub(crate) enum RemoveMode {
     /// Only field writes: the unit stops rendering and updating but stays resident.
     Hide,
     /// Real removal: the event id is released, the engine destructor runs and the
@@ -359,14 +85,14 @@ enum RemoveMode {
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum OffsetSpace {
+pub(crate) enum OffsetSpace {
     #[default]
     Camera,
     World,
 }
 
 #[derive(Clone, Deserialize)]
-struct AttackSummonSettings {
+pub(crate) struct AttackSummonSettings {
     #[serde(default = "default_marker_speffect")]
     marker_speffect: i32,
     #[serde(default = "default_vanish_request_speffect")]
@@ -513,7 +239,7 @@ fn module_dir() -> Option<PathBuf> {
 }
 
 #[derive(Clone, Copy, Deserialize)]
-struct AttackSummonConfig {
+pub(crate) struct AttackSummonConfig {
     trigger_speffect: i32,
     #[serde(default = "default_config_chr_id")]
     chr_id: i32,
@@ -598,409 +324,6 @@ impl AttackSummonConfig {
     }
 }
 
-#[derive(Clone, Copy)]
-struct AttackSummonInstance {
-    config_index: usize,
-    requested_at: Instant,
-    expires_at: Option<Instant>,
-    handle: Option<FieldInsHandle>,
-    active: bool,
-    pending_bind: bool,
-    /// Set once the unit has been made inert and is waiting for real removal.
-    /// The unit is always hidden for at least one tick before it is destroyed.
-    destroy_at: Option<Instant>,
-}
-
-impl AttackSummonInstance {
-    fn removal_started(&self) -> bool {
-        self.destroy_at.is_some()
-    }
-}
-
-#[derive(Default)]
-struct AttackSummonState {
-    summons: Vec<AttackSummonInstance>,
-    last_any_trigger: Option<Instant>,
-    last_trigger_by_slot: Vec<Option<Instant>>,
-}
-
-impl AttackSummonState {
-    fn ensure_trigger_slots(&mut self, count: usize) {
-        if self.last_trigger_by_slot.len() != count {
-            self.last_trigger_by_slot.resize(count, None);
-        }
-    }
-
-    fn accept_trigger(
-        &mut self,
-        config_index: usize,
-        now: Instant,
-        settings: &AttackSummonSettings,
-    ) -> bool {
-        if self
-            .last_any_trigger
-            .is_some_and(|last| now.duration_since(last) < settings.any_trigger_cooldown())
-        {
-            return false;
-        }
-        if self.last_trigger_by_slot[config_index]
-            .is_some_and(|last| now.duration_since(last) < settings.same_trigger_cooldown())
-        {
-            return false;
-        }
-
-        self.last_any_trigger = Some(now);
-        self.last_trigger_by_slot[config_index] = Some(now);
-        true
-    }
-
-    fn active_count(&self) -> usize {
-        self.summons
-            .iter()
-            .filter(|summon| summon.active || summon.pending_bind)
-            .count()
-    }
-
-    fn activate_or_spawn(
-        &mut self,
-        world_chr_man: &mut WorldChrMan,
-        config_index: usize,
-        now: Instant,
-        player_pos: HavokPosition,
-        player_yaw: f32,
-        forward: (f32, f32, f32),
-        right: (f32, f32, f32),
-        settings: &AttackSummonSettings,
-    ) {
-        let config = settings.summons[config_index];
-        let position = summon_position(player_pos, forward, right, config, settings);
-
-        if settings.reuses_units()
-            && let Some(index) = self
-                .summons
-                .iter()
-                .position(|summon| summon.config_index == config_index)
-        {
-            if self.summons[index].active || self.summons[index].pending_bind {
-                return;
-            }
-            if self.summons[index].destroy_at.is_some() {
-                // Staged for real removal; never bring it back.
-                self.summons.swap_remove(index);
-            } else if let Some(handle) = self.summons[index].handle {
-                if let Some(chr) = chr_by_handle_mut(world_chr_man, handle) {
-                    activate_existing_summon(chr, position, player_yaw, config, settings);
-                    self.summons[index].requested_at = now;
-                    self.summons[index].expires_at = config.expires_at(settings, now);
-                    self.summons[index].active = true;
-                    self.summons[index].pending_bind = false;
-                    log_line(format_args!(
-                        "summon reactivated: handle={handle} npc_param_id={} \
-                         event_entity_id={}",
-                        config.npc_param_id, config.event_entity_id
-                    ));
-                    return;
-                }
-
-                self.summons.swap_remove(index);
-            }
-        }
-
-        self.spawn_new(
-            world_chr_man,
-            config_index,
-            now,
-            position,
-            player_yaw,
-            settings,
-        );
-    }
-
-    fn spawn_new(
-        &mut self,
-        world_chr_man: &mut WorldChrMan,
-        config_index: usize,
-        now: Instant,
-        position: HavokPosition,
-        player_yaw: f32,
-        settings: &AttackSummonSettings,
-    ) {
-        let config = settings.summons[config_index];
-        world_chr_man.debug_chr_creator.last_created_chr = None;
-        if !spawn_debug_character(
-            world_chr_man,
-            &AttackSummonSpawnRequest {
-                chr_id: config.chr_id,
-                chara_init_param_id: config.chara_init_param_id,
-                npc_param_id: config.npc_param_id,
-                npc_think_param_id: config.npc_think_param_id,
-                event_entity_id: config.event_entity_id,
-                talk_id: config.talk_id,
-                is_player: uses_player_creation(config.chr_id, config.is_player),
-                pos_x: position.0,
-                pos_y: position.1,
-                pos_z: position.2,
-                rot_x: 0.0,
-                rot_y: player_yaw,
-                rot_z: 0.0,
-            },
-        ) {
-            return;
-        }
-
-        self.summons.push(AttackSummonInstance {
-            config_index,
-            requested_at: now,
-            expires_at: config.expires_at(settings, now),
-            handle: None,
-            active: true,
-            pending_bind: true,
-            destroy_at: None,
-        });
-    }
-
-    fn update_existing(
-        &mut self,
-        world_chr_man: &mut WorldChrMan,
-        now: Instant,
-        settings: &AttackSummonSettings,
-    ) {
-        self.bind_last_created(world_chr_man, settings);
-
-        let mut index = 0;
-        while index < self.summons.len() {
-            let should_remove = {
-                let summon = &mut self.summons[index];
-                if summon.removal_started() {
-                    true
-                } else if !summon.active && !summon.pending_bind {
-                    false
-                } else if summon.handle.is_none() {
-                    now.duration_since(summon.requested_at) >= settings.unbound_timeout()
-                } else {
-                    summon_should_disappear(world_chr_man, summon, now, settings)
-                }
-            };
-
-            if !should_remove {
-                index += 1;
-                continue;
-            }
-
-            if settings.remove_mode == RemoveMode::Destroy {
-                // Stage the unit first: make it inert and release its event ids,
-                // then let at least one tick pass before the character is torn
-                // down, so no other system is mid-iteration over it.
-                if self.summons[index].destroy_at.is_none() {
-                    let summon = &mut self.summons[index];
-                    let handle_text = match summon.handle {
-                        Some(handle) => handle.to_string(),
-                        None => "none".to_string(),
-                    };
-                    let (released, consistent) = match summon.handle {
-                        Some(handle) => release_summon_event_ids(world_chr_man, handle),
-                        None => (0, true),
-                    };
-                    release_summon(world_chr_man, summon);
-                    summon.destroy_at =
-                        Some(now.checked_add(settings.destroy_delay()).unwrap_or(now));
-                    let config = settings.summons[summon.config_index];
-                    log_line(format_args!(
-                        "summon staged for removal: handle={handle_text} npc_param_id={} \
-                         configured_event_entity_id={} released_event_ids={released} \
-                         entry_consistent={consistent}",
-                        config.npc_param_id, config.event_entity_id
-                    ));
-                }
-
-                // Physical removal is exclusively owned by the FrameEnd task.
-                index += 1;
-            } else if settings.reuses_units() && self.summons[index].handle.is_some() {
-                let summon = &mut self.summons[index];
-                park_summon(world_chr_man, summon, settings);
-                index += 1;
-            } else {
-                let summon = self.summons.swap_remove(index);
-                if let Some(handle) = summon.handle {
-                    release_summon_event_ids(world_chr_man, handle);
-                }
-                release_summon(world_chr_man, &summon);
-            }
-        }
-    }
-
-    fn finish_pending_destruction(&mut self, world: &mut WorldChrMan, now: Instant) {
-        let mut index = 0;
-        while index < self.summons.len() {
-            if !self.summons[index].destroy_at.is_some_and(|at| now >= at) {
-                index += 1;
-                continue;
-            }
-            let summon = self.summons[index];
-            let outcome = summon.handle.map(|handle| destroy_summon(world, handle));
-            if matches!(
-                outcome,
-                None | Some(DestroyOutcome::RetirementStarted) | Some(DestroyOutcome::NotFound)
-            ) {
-                self.summons.swap_remove(index);
-            } else {
-                log_line(format_args!(
-                    "summon retirement refused: outcome={}",
-                    outcome.unwrap()
-                ));
-                // Retry at a bounded rate; never discard an unresolved live instance.
-                self.summons[index].destroy_at = Some(now + Duration::from_secs(1));
-                index += 1;
-            }
-        }
-    }
-
-    fn bind_last_created(
-        &mut self,
-        world_chr_man: &mut WorldChrMan,
-        settings: &AttackSummonSettings,
-    ) {
-        let Some(mut chr_ptr) = world_chr_man.debug_chr_creator.last_created_chr else {
-            return;
-        };
-        let chr = unsafe { chr_ptr.as_mut() };
-        let Some((summon_index, config)) =
-            self.summons.iter().enumerate().find_map(|(index, summon)| {
-                let config = settings.summons[summon.config_index];
-                (summon.handle.is_none() && chr.npc_param_id == config.npc_param_id)
-                    .then_some((index, config))
-            })
-        else {
-            return;
-        };
-
-        prepare_summon(chr, config, settings, SummonPreparation::Binding);
-        chr.team_type = config.generated_team_type(settings);
-        request_spawn_animation(config.animation_id, false, |id| {
-            chr.modules.as_mut().event.as_mut().request_animation_id = id;
-        });
-        let handle = chr.field_ins_handle;
-        self.summons[summon_index].handle = Some(handle);
-        self.summons[summon_index].active = true;
-        self.summons[summon_index].pending_bind = false;
-        world_chr_man.debug_chr_creator.last_created_chr = None;
-
-        // Make the configured entity id real and report what actually happened, so
-        // the mapping can be confirmed from the log instead of from a debugger.
-        let outcome = register_event_entity_id(world_chr_man, handle, config.event_entity_id);
-        let chr_reports_id =
-            character_reports_event_entity_id(world_chr_man, handle, config.event_entity_id)
-                .unwrap_or(false);
-        // Local map check only. The actual EMEVD consumer must be tested separately.
-        let id_leads_back =
-            entity_id_owner(world_chr_man, handle, config.event_entity_id) == Some(handle);
-        let (ids, capacity) = chr_set_usage(world_chr_man, handle);
-        log_line(format_args!(
-            "summon bound: handle={handle} npc_param_id={} configured_event_entity_id={} \
-             chr_reports_id={chr_reports_id} local_set_id_resolves_to_this_unit={id_leads_back} \
-             entity_id_outcome={outcome} set_event_ids={ids} set_capacity={capacity}",
-            config.npc_param_id, config.event_entity_id,
-        ));
-        match outcome {
-            EntityIdOutcome::Conflict => log_line(format_args!(
-                "summon warning: event_entity_id={} is already owned by another character in \
-                 this character set; the configured id was NOT applied",
-                config.event_entity_id
-            )),
-            EntityIdOutcome::EntryMismatch => log_line(format_args!(
-                "summon warning: handle={handle} and its character set entry disagree; the \
-                 configured event_entity_id={} was NOT applied",
-                config.event_entity_id
-            )),
-            _ if config.event_entity_id > 0 && !id_leads_back => log_line(format_args!(
-                "summon warning: event_entity_id={} does not resolve back to handle={handle}; \
-                 event scripts will not find this unit through that id",
-                config.event_entity_id
-            )),
-            _ => {}
-        }
-    }
-
-    /// Drops every summon, for instance when the local player leaves the session.
-    ///
-    /// The removal path stays the same on purpose: it clears the character set
-    /// entry as its last step, which turns a later engine-side character set
-    /// teardown into a no-op for that slot instead of a second free. When the
-    /// engine has already torn the set down the handle stops resolving, so
-    /// nothing is freed and the outcome says so.
-    fn release_all(&mut self, world_chr_man: &mut WorldChrMan, settings: &AttackSummonSettings) {
-        for summon in &mut self.summons {
-            if summon.destroy_at.is_some() {
-                continue;
-            }
-            if let Some(handle) = summon.handle {
-                release_summon_event_ids(world_chr_man, handle);
-            }
-            release_summon(world_chr_man, summon);
-            if settings.remove_mode == RemoveMode::Destroy {
-                summon.destroy_at = Some(Instant::now() + settings.destroy_delay());
-            }
-        }
-        if settings.remove_mode != RemoveMode::Destroy {
-            self.summons.clear();
-        }
-    }
-}
-
-struct AttackSummonSpawnRequest {
-    chr_id: i32,
-    chara_init_param_id: i32,
-    npc_param_id: i32,
-    npc_think_param_id: i32,
-    event_entity_id: i32,
-    talk_id: i32,
-    is_player: bool,
-    pos_x: f32,
-    pos_y: f32,
-    pos_z: f32,
-    rot_x: f32,
-    rot_y: f32,
-    rot_z: f32,
-}
-
-fn spawn_debug_character(
-    world_chr_man: &mut WorldChrMan,
-    request: &AttackSummonSpawnRequest,
-) -> bool {
-    let creator = &mut world_chr_man.debug_chr_creator;
-    let init_data = &mut creator.init_data;
-    if std::mem::size_of_val(init_data) != DEBUG_CREATOR_INIT_DATA_SIZE {
-        return false;
-    }
-
-    let mut name_bytes = character_model_name(request.chr_id)
-        .encode_utf16()
-        .collect::<Vec<_>>();
-    name_bytes.resize(0x20, 0);
-
-    init_data.name.clone_from_slice(&name_bytes);
-    init_data.chara_init_param_id = request.chara_init_param_id;
-    init_data.npc_param_id = request.npc_param_id;
-    init_data.npc_think_param_id = request.npc_think_param_id;
-    init_data.event_entity_id = request.event_entity_id;
-    init_data.talk_id = request.talk_id;
-    init_data.spawn_position = F32Vector4(request.pos_x, request.pos_y, request.pos_z, 0.0);
-
-    // These fields are private in the pinned fsrs revision. The exact revision and
-    // init-data size guard keep this small bridge tied to its verified layout.
-    unsafe {
-        let base = std::ptr::from_mut(init_data).cast::<u8>();
-        base.add(DEBUG_CREATOR_SPAWN_ROTATION_OFFSET)
-            .cast::<F32Vector4>()
-            .write(F32Vector4(request.rot_x, request.rot_y, request.rot_z, 0.0));
-        base.add(DEBUG_CREATOR_ENEMY_TYPE_OFFSET)
-            .write(u8::from(request.is_player));
-    }
-
-    creator.spawn = true;
-    true
-}
-
 fn character_model_name(chr_id: i32) -> String {
     format!("c{:0>4}", chr_id)
 }
@@ -1009,32 +332,6 @@ fn uses_player_creation(chr_id: i32, is_player: bool) -> bool {
     // c0000 NPCs share the player-character creation path; this does not
     // designate them as the local player or replace the main_player pointer.
     chr_id == 0 || is_player
-}
-
-fn summon_should_disappear(
-    world_chr_man: &mut WorldChrMan,
-    summon: &AttackSummonInstance,
-    now: Instant,
-    settings: &AttackSummonSettings,
-) -> bool {
-    if summon.expires_at.is_some_and(|deadline| now >= deadline) {
-        return true;
-    }
-    let config = settings.summons[summon.config_index];
-
-    let Some(handle) = summon.handle else {
-        return false;
-    };
-    let Some(chr) = chr_by_handle_mut(world_chr_man, handle) else {
-        return true;
-    };
-
-    if chr_dead(chr) || chr_has_speffect(chr, config.vanish_request_speffect(settings)) {
-        return true;
-    }
-
-    prepare_summon(chr, config, settings, SummonPreparation::Updating);
-    false
 }
 
 fn summon_position(
@@ -1060,221 +357,12 @@ fn summon_position(
     )
 }
 
-fn activate_existing_summon(
-    chr: &mut ChrIns,
-    position: HavokPosition,
-    player_yaw: f32,
-    config: AttackSummonConfig,
-    settings: &AttackSummonSettings,
-) {
-    chr.remove_speffect(config.vanish_request_speffect(settings));
-    prepare_summon(chr, config, settings, SummonPreparation::Reactivating);
-    move_summon(chr, position, player_yaw);
-    restore_summon_hp(chr);
-    chr.team_type = config.generated_team_type(settings);
-    request_spawn_animation(config.animation_id, true, |id| {
-        chr.modules.as_mut().event.as_mut().request_animation_id = id;
-    });
-}
-
-// -1 means no request at all, including no reset of another system's request.
-// Explicit animations retain the reset needed when reactivating a hidden unit.
-fn request_spawn_animation(animation_id: i32, reused: bool, mut write: impl FnMut(i32)) {
-    if animation_id == -1 {
-        return;
+fn normalize_horizontal(vector: (f32, f32, f32), fallback: (f32, f32, f32)) -> (f32, f32, f32) {
+    let len = (vector.0 * vector.0 + vector.2 * vector.2).sqrt();
+    if len <= 0.001 || !len.is_finite() {
+        return fallback;
     }
-    if reused {
-        write(-1);
-    }
-    write(animation_id);
-}
-
-fn move_summon(chr: &mut ChrIns, position: HavokPosition, yaw: f32) {
-    let half_yaw = yaw * 0.5;
-    let orientation = Quaternion(0.0, half_yaw.sin(), 0.0, half_yaw.cos());
-    let physics = chr.modules.as_mut().physics.as_mut();
-    physics.position = position;
-    physics.last_update_position = position;
-    physics.orientation = orientation;
-    physics.interpolated_orientation = orientation;
-    physics.orientation_euler = F32Vector4(0.0, yaw, 0.0, 0.0);
-    chr.initial_position = position;
-    chr.initial_orientation_euler = F32Vector4(0.0, yaw, 0.0, 0.0);
-    chr.chunk_position = F32Vector4(position.0, position.1, position.2, 0.0);
-    chr.chr_ctrl
-        .as_mut()
-        .chr_proxy_flags
-        .set_rotation_sync_requested(true);
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SummonPreparation {
-    Binding,
-    Updating,
-    Reactivating,
-}
-
-// Field order: animation opacity, previous opacity, tint, tint modifier,
-// camouflage, base transparency, base modifier.
-fn update_summon_visibility(phase: SummonPreparation, fields: [&mut f32; 7]) {
-    if phase == SummonPreparation::Reactivating {
-        // park_summon only zeros these four fields. Animation keyframe opacity
-        // and camouflage remain owned by the engine even during reactivation.
-        for (index, value) in fields.into_iter().enumerate() {
-            if matches!(index, 2 | 3 | 5 | 6) {
-                *value = 1.0;
-            }
-        }
-    }
-}
-
-fn prepare_summon(
-    chr: &mut ChrIns,
-    config: AttackSummonConfig,
-    settings: &AttackSummonSettings,
-    phase: SummonPreparation,
-) {
-    let marker_speffect = config.marker_speffect(settings);
-    if !chr_has_speffect(chr, marker_speffect) {
-        chr.apply_speffect(marker_speffect, true);
-    }
-
-    chr.chr_ctrl
-        .as_mut()
-        .modifier
-        .as_mut()
-        .data
-        .action_flags
-        .set_disable_lock_on(config.disable_lock_on(settings));
-    update_summon_visibility(phase, [
-        &mut chr.opacity_keyframes_multiplier,
-        &mut chr.opacity_keyframes_multiplier_previous,
-        &mut chr.tint_alpha_multiplier,
-        &mut chr.tint_alpha_multiplier_modifier,
-        &mut chr.camouflage_transparency,
-        &mut chr.base_transparency,
-        &mut chr.base_transparency_modifier,
-    ]);
-    if phase == SummonPreparation::Updating {
-        // Animation notifies and events can control render/activation flags.
-        // A live update should not repeat the initial visibility setup.
-        return;
-    }
-    chr.last_hit_by = FieldInsHandle {
-        selector: FieldInsSelector(u32::MAX),
-        block_id: BlockId::none(),
-    };
-    chr.load_state.set_extinction_death(false);
-    chr.chr_flags1c4.set_is_render_group_enabled(true);
-    chr.chr_flags1c5.set_death_flag(false);
-    chr.chr_flags1c5.set_enable_render(true);
-    chr.chr_flags1c8.set_is_active(true);
-    chr.chr_activation_flags.set_activation_enabled(true);
-    let debug_flags = &mut chr.debug_flags;
-    debug_flags.set_force_unloaded(false);
-    debug_flags.set_force_loaded(true);
-    debug_flags.set_character_disabled(false);
-    debug_flags.set_disabled_updates(false);
-    debug_flags.set_disabled_hit(false);
-    debug_flags.set_disabled_movement(false);
-    debug_flags.set_disabled_secondary_actions(false);
-}
-
-fn restore_summon_hp(chr: &mut ChrIns) {
-    let data = chr.modules.as_mut().data.as_mut();
-    data.hp = data.max_hp.max(1);
-}
-
-fn park_summon(
-    world_chr_man: &mut WorldChrMan,
-    summon: &mut AttackSummonInstance,
-    settings: &AttackSummonSettings,
-) {
-    let Some(handle) = summon.handle else {
-        summon.active = false;
-        summon.pending_bind = false;
-        return;
-    };
-    let Some(chr) = chr_by_handle_mut(world_chr_man, handle) else {
-        summon.handle = None;
-        summon.active = false;
-        summon.pending_bind = false;
-        return;
-    };
-    let config = settings.summons[summon.config_index];
-
-    chr.remove_speffect(config.vanish_request_speffect(settings));
-    restore_summon_hp(chr);
-    chr.modules.as_mut().event.as_mut().request_animation_id = -1;
-    chr.chr_flags1c5.set_death_flag(false);
-    chr.chr_flags1c5.set_enable_render(false);
-    chr.chr_flags1c8.set_is_active(true);
-    let debug_flags = &mut chr.debug_flags;
-    debug_flags.set_force_loaded(true);
-    debug_flags.set_force_unloaded(false);
-    debug_flags.set_character_disabled(false);
-    debug_flags.set_disabled_updates(false);
-    debug_flags.set_disabled_hit(true);
-    debug_flags.set_disabled_movement(false);
-    debug_flags.set_disabled_secondary_actions(false);
-    chr.base_transparency = 0.0;
-    chr.base_transparency_modifier = 0.0;
-    chr.tint_alpha_multiplier = 0.0;
-    chr.tint_alpha_multiplier_modifier = 0.0;
-    summon.active = false;
-    summon.pending_bind = false;
-}
-
-fn release_summon(world_chr_man: &mut WorldChrMan, summon: &AttackSummonInstance) {
-    let Some(handle) = summon.handle else {
-        return;
-    };
-    let Some(chr) = chr_by_handle_mut(world_chr_man, handle) else {
-        return;
-    };
-
-    let data = chr.modules.as_mut().data.as_mut();
-    data.hp = 0;
-    chr.chr_flags1c5.set_death_flag(true);
-    chr.chr_flags1c5.set_enable_render(false);
-    chr.chr_flags1c8.set_is_active(false);
-    let debug_flags = &mut chr.debug_flags;
-    debug_flags.set_force_loaded(false);
-    debug_flags.set_force_unloaded(true);
-    debug_flags.set_character_disabled(true);
-    debug_flags.set_disabled_updates(true);
-    debug_flags.set_disabled_hit(true);
-    debug_flags.set_disabled_movement(true);
-    debug_flags.set_disabled_secondary_actions(true);
-    chr.base_transparency = 0.0;
-    chr.base_transparency_modifier = 0.0;
-    chr.tint_alpha_multiplier = 0.0;
-    chr.tint_alpha_multiplier_modifier = 0.0;
-}
-
-fn chr_dead(chr: &ChrIns) -> bool {
-    let data = chr.modules.as_ref().data.as_ref();
-    data.hp <= 0 || chr.chr_flags1c5.death_flag()
-}
-
-fn chr_has_speffect(chr: &ChrIns, sp_effect: i32) -> bool {
-    chr.special_effect
-        .entries()
-        .any(|entry| entry.param_id == sp_effect)
-}
-
-fn chr_by_handle_mut(
-    world_chr_man: &mut WorldChrMan,
-    handle: FieldInsHandle,
-) -> Option<&mut ChrIns> {
-    if let Some(mut chr_ptr) = world_chr_man.debug_chr_creator.last_created_chr {
-        let chr = unsafe { chr_ptr.as_mut() };
-        if chr.field_ins_handle == handle {
-            return Some(chr);
-        }
-    }
-
-    world_chr_man.chr_ins_by_handle_mut(&handle)
+    (vector.0 / len, 0.0, vector.2 / len)
 }
 
 fn default_marker_speffect() -> i32 {
@@ -1480,10 +568,12 @@ mod tests {
 
     #[test]
     fn world_offsets_ignore_camera_axes_and_camera_offsets_rotate() {
-        let mut settings = AttackSummonSettings::default();
-        settings.offset_forward = 3.0;
-        settings.offset_right = -2.0;
-        settings.offset_up = 0.5;
+        let mut settings = AttackSummonSettings {
+            offset_forward: 3.0,
+            offset_right: -2.0,
+            offset_up: 0.5,
+            ..Default::default()
+        };
         let mut config = settings.summons[0];
         config.offset_right = None;
         let origin = HavokPosition(10.0, 20.0, 30.0, 0.0);
@@ -1491,19 +581,37 @@ mod tests {
         let standard = ((0.0, 0.0, 1.0), (1.0, 0.0, 0.0));
         let coords = |p: HavokPosition| (p.0, p.1, p.2);
         assert_eq!(config.offset_space(&settings), OffsetSpace::Camera);
-        assert_eq!(coords(summon_position(origin, rotated.0, rotated.1, config, &settings)), (13.0, 20.5, 32.0));
+        assert_eq!(
+            coords(summon_position(
+                origin, rotated.0, rotated.1, config, &settings
+            )),
+            (13.0, 20.5, 32.0)
+        );
         settings.offset_space = OffsetSpace::World;
         for axes in [rotated, standard] {
-            assert_eq!(coords(summon_position(origin, axes.0, axes.1, config, &settings)), (8.0, 20.5, 33.0));
+            assert_eq!(
+                coords(summon_position(origin, axes.0, axes.1, config, &settings)),
+                (8.0, 20.5, 33.0)
+            );
         }
         config.offset_space = Some(OffsetSpace::Camera);
-        assert_eq!(coords(summon_position(origin, rotated.0, rotated.1, config, &settings)), (13.0, 20.5, 32.0));
+        assert_eq!(
+            coords(summon_position(
+                origin, rotated.0, rotated.1, config, &settings
+            )),
+            (13.0, 20.5, 32.0)
+        );
         config.offset_space = Some(OffsetSpace::World);
         config.offset_forward = Some(-4.0);
         config.offset_right = Some(5.0);
         config.offset_up = Some(-1.0);
         settings.offset_space = OffsetSpace::Camera;
-        assert_eq!(coords(summon_position(origin, rotated.0, rotated.1, config, &settings)), (15.0, 19.0, 26.0));
+        assert_eq!(
+            coords(summon_position(
+                origin, rotated.0, rotated.1, config, &settings
+            )),
+            (15.0, 19.0, 26.0)
+        );
     }
 
     #[test]
@@ -1521,38 +629,51 @@ animation_id = -1
 offset_space = "camera"
 "#;
         let settings: AttackSummonSettings = toml::from_str(text).unwrap();
-        assert_eq!(settings.summons[0].offset_space(&settings), OffsetSpace::World);
-        assert_eq!(settings.summons[1].offset_space(&settings), OffsetSpace::Camera);
-        let legacy: AttackSummonSettings = toml::from_str(&text.replace("offset_space = \"world\"", "")).unwrap();
+        assert_eq!(
+            settings.summons[0].offset_space(&settings),
+            OffsetSpace::World
+        );
+        assert_eq!(
+            settings.summons[1].offset_space(&settings),
+            OffsetSpace::Camera
+        );
+        let legacy: AttackSummonSettings =
+            toml::from_str(&text.replace("offset_space = \"world\"", "")).unwrap();
         assert_eq!(legacy.summons[0].offset_space(&legacy), OffsetSpace::Camera);
-        assert!(toml::from_str::<AttackSummonSettings>(&text.replace("\"world\"", "\"wrold\"")).is_err());
+        assert!(
+            toml::from_str::<AttackSummonSettings>(&text.replace("\"world\"", "\"wrold\""))
+                .is_err()
+        );
     }
 
     #[test]
     fn animation_fade_survives_summon_binding_and_updates() {
-        let mut alpha = [0.8, 0.9, 0.7, 0.6, 0.5, 0.4, 0.3];
-        let expected = alpha;
-        update_summon_visibility(SummonPreparation::Binding, alpha.each_mut());
-        assert_eq!(alpha, expected, "binding must preserve an already-started animation fade");
-        // Replay animation-written values through the production update seam.
-        for opacity in [0.75, 0.5, 0.25, 0.0, 0.25, 0.5, 1.0] {
-            alpha = [opacity, opacity, 0.7, 0.6, 0.5, 0.4, 0.3];
-            let expected = alpha;
-            update_summon_visibility(SummonPreparation::Updating, alpha.each_mut());
-            assert_eq!(alpha, expected, "summon update overwrote the animation's alpha");
+        for phase in [presentation::Phase::Binding, presentation::Phase::Updating] {
+            let input = host::presentation_input_for_test(phase);
+            assert!(
+                !presentation::plan(&input)
+                    .unwrap()
+                    .iter()
+                    .any(|s| matches!(s, presentation::Step::Opacity(_)))
+            );
         }
     }
 
     #[test]
     fn hidden_reactivation_restores_only_fields_changed_by_parking() {
-        let mut alpha = [0.35, 0.4, 0.0, 0.0, 0.6, 0.0, 0.0];
-        update_summon_visibility(SummonPreparation::Reactivating, alpha.each_mut());
-        assert_eq!(alpha, [0.35, 0.4, 1.0, 1.0, 0.6, 1.0, 1.0]);
+        let mut input = host::presentation_input_for_test(presentation::Phase::Reactivating);
+        input.visible_opacity = [0.0, -1.0, 0.6, 0.0];
+        assert!(
+            presentation::plan(&input)
+                .unwrap()
+                .contains(&presentation::Step::Opacity(input.visible_opacity))
+        );
     }
 
     #[test]
     fn humanoid_config_survives_runtime_filter_and_uses_player_creation() {
-        let settings = parse_settings(r#"
+        let settings = parse_settings(
+            r#"
 [[summons]]
 trigger_speffect = 3269
 chr_id = 0
@@ -1570,7 +691,8 @@ trigger_speffect = 99
 chr_id = -1
 npc_param_id = 1
 animation_id = -1
-"#);
+"#,
+        );
         assert_eq!(settings.summons.len(), 2);
         let human = settings.summons[0];
         assert_eq!(character_model_name(human.chr_id), "c0000");
@@ -1587,18 +709,31 @@ animation_id = -1
 
     #[test]
     fn spawn_animation_minus_one_does_not_touch_pending_request() {
-        for reused in [false, true] {
-            let mut writes = Vec::new();
-            request_spawn_animation(-1, reused, |id| writes.push(id));
-            assert!(writes.is_empty());
-            request_spawn_animation(20012, reused, |id| writes.push(id));
-            assert_eq!(writes, if reused { vec![-1, 20012] } else { vec![20012] });
+        for (phase, reused) in [
+            (presentation::Phase::Binding, false),
+            (presentation::Phase::Reactivating, true),
+        ] {
+            let mut input = host::presentation_input_for_test(phase);
+            input.animation = -1;
+            assert!(
+                !presentation::plan(&input)
+                    .unwrap()
+                    .iter()
+                    .any(|s| matches!(s, presentation::Step::Animation { .. }))
+            );
+            input.animation = 20012;
+            assert!(
+                presentation::plan(&input)
+                    .unwrap()
+                    .contains(&presentation::Step::Animation { id: 20012, reused })
+            );
         }
     }
 
     #[test]
     fn summon_team_override_and_no_animation_parse_together() {
-        let settings: AttackSummonSettings = toml::from_str(r#"
+        let settings: AttackSummonSettings = toml::from_str(
+            r#"
 generated_team_type = 6
 [[summons]]
 trigger_speffect = 1
@@ -1609,7 +744,9 @@ generated_team_type = 26
 trigger_speffect = 2
 npc_param_id = 3
 animation_id = -1
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         assert_eq!(settings.summons[0].generated_team_type(&settings), 26);
         assert_eq!(settings.summons[1].generated_team_type(&settings), 6);
         assert_eq!(settings.summons[0].animation_id, -1);
@@ -1655,46 +792,27 @@ fallback_lifetime_ms = 10000
     #[test]
     fn unlimited_staged_removal_survives_cleared_trigger_and_inactive_state() {
         let now = Instant::now();
-        let summon = AttackSummonInstance {
-            config_index: 0,
-            requested_at: now,
-            expires_at: None,
-            handle: None,
-            active: false,
-            pending_bind: false,
-            destroy_at: Some(now + Duration::from_millis(100)),
-        };
-        assert!(summon.removal_started());
-        assert!(!summon.destroy_at.is_some_and(|at| now >= at));
-        assert!(
-            summon
-                .destroy_at
-                .is_some_and(|at| now + Duration::from_millis(100) >= at)
-        );
+        let deadline = Some(now + Duration::from_millis(100));
+        assert!(!host::retirement_due(deadline, now));
+        assert!(host::retirement_due(
+            deadline,
+            now + Duration::from_millis(100)
+        ));
     }
 
     #[test]
     fn supports_only_the_pinned_fsrs_game_versions() {
-        assert!(SupportedErVersion::from_lang_version(LANG_ID_EN, "2.7.1.0").is_some());
-        assert!(SupportedErVersion::from_lang_version(LANG_ID_JP, "2.7.1.1").is_none());
-        assert!(SupportedErVersion::from_lang_version(LANG_ID_EN, "2.8.0.0").is_none());
-        assert!(SupportedErVersion::from_lang_version(LANG_ID_EN, "2.7.0.0").is_some());
-        assert!(SupportedErVersion::from_lang_version(LANG_ID_JP, "2.7.0.1").is_some());
-        assert!(SupportedErVersion::from_lang_version(LANG_ID_EN, "2.6.2.0").is_none());
-        assert!(SupportedErVersion::from_lang_version(LANG_ID_JP, "2.6.2.1").is_none());
+        assert_eq!(shikifsrs_elden_ring::WW_171.file_size, 87042128);
+        assert!(shikifsrs_elden_ring::Ww171File::verify(&[]).is_err());
+        assert_eq!(
+            shikifsrs_elden_ring::WW_171.name,
+            "Elden Ring WW 1.17.1 / EXE 2.7.1.0"
+        );
     }
 
     #[test]
     fn pinned_debug_creator_layout_matches_private_field_bridge() {
-        assert_eq!(std::mem::size_of::<ChrIns>(), 0x580);
-        assert_eq!(std::mem::offset_of!(ChrIns, debug_flags), 0x538);
-        assert_eq!(std::mem::offset_of!(ChrIns, debug_role_param_id), 0x54c);
-        assert_eq!(
-            std::mem::size_of::<eldenring::cs::CSDebugChrCreatorInitData>(),
-            DEBUG_CREATOR_INIT_DATA_SIZE
-        );
-        assert_eq!(DEBUG_CREATOR_SPAWN_ROTATION_OFFSET, 0x10);
-        assert_eq!(DEBUG_CREATOR_ENEMY_TYPE_OFFSET, 0xc8);
+        native_guards::assert_creation_guard();
     }
 
     /// Pins the offsets the lifecycle module was written against.
@@ -1704,38 +822,7 @@ fallback_lifetime_ms = 10000
     /// depends on. Native byte fixtures are retained under `tests/fixtures/`.
     #[test]
     fn pinned_chr_lifecycle_offsets_match_disassembly() {
-        use eldenring::cs::{ChrSet, ChrSetEntry, PlayerIns};
-        use std::mem::{offset_of, size_of};
-
-        // ChrIns: vftable +0x00, handle +0x08, chr_set_entry +0x10, event id +0x1e8.
-        assert_eq!(offset_of!(ChrIns, vftable), 0x00);
-        assert_eq!(offset_of!(ChrIns, field_ins_handle), 0x08);
-        assert_eq!(offset_of!(ChrIns, chr_set_entry), 0x10);
-        assert_eq!(offset_of!(ChrIns, event_entity_id), 0x1e8);
-
-        // ChrSet: capacity +0x10, entries +0x18, entity id map +0x28, group map +0x40.
-        assert_eq!(offset_of!(ChrSet<ChrIns>, capacity), 0x10);
-        assert_eq!(offset_of!(ChrSet<ChrIns>, entries), 0x18);
-        assert_eq!(offset_of!(ChrSet<ChrIns>, entity_id_mapping), 0x28);
-        assert_eq!(offset_of!(ChrSet<ChrIns>, group_id_mapping), 0x40);
-
-        // ChrSetEntry is the 0x10 byte stride free_chr_list walks the array with.
-        assert_eq!(size_of::<ChrSetEntry<ChrIns>>(), 0x10);
-        assert_eq!(offset_of!(ChrSetEntry<ChrIns>, chr_ins), 0x00);
-        assert_eq!(offset_of!(ChrSetEntry<ChrIns>, chr_load_status), 0x08);
-        assert_eq!(offset_of!(ChrSetEntry<ChrIns>, chr_update_type), 0x09);
-        assert_eq!(offset_of!(ChrSetEntry<ChrIns>, entry_flags), 0x0a);
-
-        // DLMap: allocator +0x00, node head +0x08, size +0x10, so 0x18 bytes. The
-        // map is the last member of ChrSet, so the tail of the structure measures
-        // it without the private `eldenring::stl` module having to be nameable.
-        assert_eq!(
-            size_of::<ChrSet<ChrIns>>() - offset_of!(ChrSet<ChrIns>, group_id_mapping),
-            0x18
-        );
-
-        // Lock-on has to be cleared before the character is freed.
-        assert_eq!(offset_of!(PlayerIns, locked_on_enemy), 0x6b0);
+        native_guards::assert_retirement_guards();
     }
 
     #[test]

@@ -7,8 +7,8 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-eldenring = { git = "https://github.com/KamiyamaShiki0704/fromsoftware-rs", rev = "02fa5681e27fd2ecd9da79d34aef9fae96805539" }
-fromsoftware-shared = { git = "https://github.com/KamiyamaShiki0704/fromsoftware-rs", rev = "02fa5681e27fd2ecd9da79d34aef9fae96805539" }
+shikifsrs-elden-ring = { git = "https://github.com/KamiyamaShiki0704/ShikiFSRS.git", rev = "930f818431e72209b49d2e37265a1f8150fa5390" }
+shikifsrs-runtime = { git = "https://github.com/KamiyamaShiki0704/ShikiFSRS.git", rev = "930f818431e72209b49d2e37265a1f8150fa5390" }
 toml = "1.1.4"
 
 [dependencies.serde]
@@ -40,3 +40,8 @@ crate-type = ["cdylib"]
 # possible, which a stripped build cannot offer.
 debug = 2
 strip = "none"
+
+[dev-dependencies]
+sha2 = "=0.11.0"
+
+[workspace]
