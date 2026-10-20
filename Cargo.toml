@@ -7,8 +7,8 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-eldenring = { path = "../fromsoftware-rs/crates/eldenring" }
-fromsoftware-shared = { path = "../fromsoftware-rs/crates/shared" }
+eldenring = { git = "https://github.com/KamiyamaShiki0704/fromsoftware-rs", rev = "dd7b5a1d71169a3d3cbdfc619ecd72be169f17d5" }
+fromsoftware-shared = { git = "https://github.com/KamiyamaShiki0704/fromsoftware-rs", rev = "dd7b5a1d71169a3d3cbdfc619ecd72be169f17d5" }
 toml = "1.1.4"
 
 [dependencies.serde]
