@@ -112,6 +112,7 @@ pub unsafe extern "C" fn DllMain(hmodule: HINSTANCE, reason: u32, _: *mut c_void
 enum SupportedErVersion {
     Ww2700,
     Ww2710,
+    Ww2720,
     Jp2701,
 }
 
@@ -122,6 +123,7 @@ impl GameVersion for SupportedErVersion {
         match (lang_id, version) {
             (LANG_ID_EN, "2.7.0.0") => Some(Self::Ww2700),
             (LANG_ID_EN, "2.7.1.0") => Some(Self::Ww2710),
+            (LANG_ID_EN, "2.7.2.0") => Some(Self::Ww2720),
             (LANG_ID_JP, "2.7.0.1") => Some(Self::Jp2701),
             _ => None,
         }
@@ -132,7 +134,14 @@ fn supported_executable(program: Program<'_>) -> bool {
     let Program::Mapping(module) = program else {
         return false;
     };
-    SupportedErVersion::detect(&module).is_ok()
+    (match SupportedErVersion::detect(&module) {
+        Ok(SupportedErVersion::Ww2720) => std::env::current_exe()
+            .ok()
+            .and_then(|p| std::fs::read(p).ok())
+            .is_some_and(|bytes| eldenring::verify_ww272_file(&bytes)),
+        Ok(_) => true,
+        Err(_) => false,
+    }) && eldenring::initialize_game_bindings().is_ok()
 }
 
 fn install_tasks_once() {
@@ -191,7 +200,8 @@ fn retirement_frame_end(data: &FD4TaskData) {
     if first {
         log_line(format_args!(
             "[DEBUG-retirement-dispatch] first-callback observed_group={} expected_group={}",
-            data.task_group_id, CSTaskGroupIndex::FrameEnd as u32
+            data.task_group_id,
+            CSTaskGroupIndex::FrameEnd as u32
         ));
     }
     if !is_retirement_frame_end(data.task_group_id) {
@@ -235,20 +245,25 @@ fn attack_summon_task(_: &FD4TaskData) {
 
     state.ensure_trigger_slots(settings.summons.len());
     state.update_existing(world_chr_man, now, settings);
-    let staged = state.summons.iter().filter(|s| s.destroy_at.is_some()).count();
-    if staged > 0 {
-        if let Ok(mut report_at) = RETIREMENT_REPORT_AT.lock() {
-            if report_at.is_none_or(|at| now >= at) {
-                *report_at = Some(now + Duration::from_secs(5));
-                log_line(format_args!(
-                    "[DEBUG-retirement-dispatch] staged={} callbacks={} accepted={} observed_group={} expected_group={} status={} (0=not-called,1=group-rejected,2=no-world,3=no-player,4=lock-poisoned,5=processing,6=completed)",
-                    staged, RETIREMENT_CALLBACKS.load(Ordering::Relaxed),
-                    RETIREMENT_ACCEPTED.load(Ordering::Relaxed),
-                    RETIREMENT_GROUP.load(Ordering::Relaxed), CSTaskGroupIndex::FrameEnd as u32,
-                    RETIREMENT_STATUS.load(Ordering::Relaxed),
-                ));
-            }
-        }
+    let staged = state
+        .summons
+        .iter()
+        .filter(|s| s.destroy_at.is_some())
+        .count();
+    if staged > 0
+        && let Ok(mut report_at) = RETIREMENT_REPORT_AT.lock()
+        && report_at.is_none_or(|at| now >= at)
+    {
+        *report_at = Some(now + Duration::from_secs(5));
+        log_line(format_args!(
+            "[DEBUG-retirement-dispatch] staged={} callbacks={} accepted={} observed_group={} expected_group={} status={} (0=not-called,1=group-rejected,2=no-world,3=no-player,4=lock-poisoned,5=processing,6=completed)",
+            staged,
+            RETIREMENT_CALLBACKS.load(Ordering::Relaxed),
+            RETIREMENT_ACCEPTED.load(Ordering::Relaxed),
+            RETIREMENT_GROUP.load(Ordering::Relaxed),
+            CSTaskGroupIndex::FrameEnd as u32,
+            RETIREMENT_STATUS.load(Ordering::Relaxed),
+        ));
     }
 
     let Some((player_pos, player_yaw, triggers)) = consume_player_triggers(world_chr_man, settings)
@@ -661,6 +676,10 @@ impl AttackSummonState {
             .count()
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Preserve the established spawn transaction inputs during the version port"
+    )]
     fn activate_or_spawn(
         &mut self,
         world_chr_man: &mut WorldChrMan,
@@ -726,7 +745,7 @@ impl AttackSummonState {
         settings: &AttackSummonSettings,
     ) {
         let config = settings.summons[config_index];
-        world_chr_man.debug_chr_creator.last_created_chr = None;
+        world_chr_man.debug_chr_creator_mut().last_created_chr = None;
         if !spawn_debug_character(
             world_chr_man,
             &AttackSummonSpawnRequest {
@@ -832,7 +851,7 @@ impl AttackSummonState {
     fn finish_pending_destruction(&mut self, world: &mut WorldChrMan, now: Instant) {
         let mut index = 0;
         while index < self.summons.len() {
-            if !self.summons[index].destroy_at.is_some_and(|at| now >= at) {
+            if self.summons[index].destroy_at.is_none_or(|at| now < at) {
                 index += 1;
                 continue;
             }
@@ -860,7 +879,7 @@ impl AttackSummonState {
         world_chr_man: &mut WorldChrMan,
         settings: &AttackSummonSettings,
     ) {
-        let Some(mut chr_ptr) = world_chr_man.debug_chr_creator.last_created_chr else {
+        let Some(mut chr_ptr) = world_chr_man.debug_chr_creator().last_created_chr else {
             return;
         };
         let chr = unsafe { chr_ptr.as_mut() };
@@ -883,7 +902,7 @@ impl AttackSummonState {
         self.summons[summon_index].handle = Some(handle);
         self.summons[summon_index].active = true;
         self.summons[summon_index].pending_bind = false;
-        world_chr_man.debug_chr_creator.last_created_chr = None;
+        world_chr_man.debug_chr_creator_mut().last_created_chr = None;
 
         // Make the configured entity id real and report what actually happened, so
         // the mapping can be confirmed from the log instead of from a debugger.
@@ -967,7 +986,7 @@ fn spawn_debug_character(
     world_chr_man: &mut WorldChrMan,
     request: &AttackSummonSpawnRequest,
 ) -> bool {
-    let creator = &mut world_chr_man.debug_chr_creator;
+    let creator = world_chr_man.debug_chr_creator_mut();
     let init_data = &mut creator.init_data;
     if std::mem::size_of_val(init_data) != DEBUG_CREATOR_INIT_DATA_SIZE {
         return false;
@@ -1146,15 +1165,18 @@ fn prepare_summon(
         .data
         .action_flags
         .set_disable_lock_on(config.disable_lock_on(settings));
-    update_summon_visibility(phase, [
-        &mut chr.opacity_keyframes_multiplier,
-        &mut chr.opacity_keyframes_multiplier_previous,
-        &mut chr.tint_alpha_multiplier,
-        &mut chr.tint_alpha_multiplier_modifier,
-        &mut chr.camouflage_transparency,
-        &mut chr.base_transparency,
-        &mut chr.base_transparency_modifier,
-    ]);
+    update_summon_visibility(
+        phase,
+        [
+            &mut chr.opacity_keyframes_multiplier,
+            &mut chr.opacity_keyframes_multiplier_previous,
+            &mut chr.tint_alpha_multiplier,
+            &mut chr.tint_alpha_multiplier_modifier,
+            &mut chr.camouflage_transparency,
+            &mut chr.base_transparency,
+            &mut chr.base_transparency_modifier,
+        ],
+    );
     if phase == SummonPreparation::Updating {
         // Animation notifies and events can control render/activation flags.
         // A live update should not repeat the initial visibility setup.
@@ -1267,7 +1289,7 @@ fn chr_by_handle_mut(
     world_chr_man: &mut WorldChrMan,
     handle: FieldInsHandle,
 ) -> Option<&mut ChrIns> {
-    if let Some(mut chr_ptr) = world_chr_man.debug_chr_creator.last_created_chr {
+    if let Some(mut chr_ptr) = world_chr_man.debug_chr_creator().last_created_chr {
         let chr = unsafe { chr_ptr.as_mut() };
         if chr.field_ins_handle == handle {
             return Some(chr);
@@ -1491,19 +1513,37 @@ mod tests {
         let standard = ((0.0, 0.0, 1.0), (1.0, 0.0, 0.0));
         let coords = |p: HavokPosition| (p.0, p.1, p.2);
         assert_eq!(config.offset_space(&settings), OffsetSpace::Camera);
-        assert_eq!(coords(summon_position(origin, rotated.0, rotated.1, config, &settings)), (13.0, 20.5, 32.0));
+        assert_eq!(
+            coords(summon_position(
+                origin, rotated.0, rotated.1, config, &settings
+            )),
+            (13.0, 20.5, 32.0)
+        );
         settings.offset_space = OffsetSpace::World;
         for axes in [rotated, standard] {
-            assert_eq!(coords(summon_position(origin, axes.0, axes.1, config, &settings)), (8.0, 20.5, 33.0));
+            assert_eq!(
+                coords(summon_position(origin, axes.0, axes.1, config, &settings)),
+                (8.0, 20.5, 33.0)
+            );
         }
         config.offset_space = Some(OffsetSpace::Camera);
-        assert_eq!(coords(summon_position(origin, rotated.0, rotated.1, config, &settings)), (13.0, 20.5, 32.0));
+        assert_eq!(
+            coords(summon_position(
+                origin, rotated.0, rotated.1, config, &settings
+            )),
+            (13.0, 20.5, 32.0)
+        );
         config.offset_space = Some(OffsetSpace::World);
         config.offset_forward = Some(-4.0);
         config.offset_right = Some(5.0);
         config.offset_up = Some(-1.0);
         settings.offset_space = OffsetSpace::Camera;
-        assert_eq!(coords(summon_position(origin, rotated.0, rotated.1, config, &settings)), (15.0, 19.0, 26.0));
+        assert_eq!(
+            coords(summon_position(
+                origin, rotated.0, rotated.1, config, &settings
+            )),
+            (15.0, 19.0, 26.0)
+        );
     }
 
     #[test]
@@ -1521,11 +1561,21 @@ animation_id = -1
 offset_space = "camera"
 "#;
         let settings: AttackSummonSettings = toml::from_str(text).unwrap();
-        assert_eq!(settings.summons[0].offset_space(&settings), OffsetSpace::World);
-        assert_eq!(settings.summons[1].offset_space(&settings), OffsetSpace::Camera);
-        let legacy: AttackSummonSettings = toml::from_str(&text.replace("offset_space = \"world\"", "")).unwrap();
+        assert_eq!(
+            settings.summons[0].offset_space(&settings),
+            OffsetSpace::World
+        );
+        assert_eq!(
+            settings.summons[1].offset_space(&settings),
+            OffsetSpace::Camera
+        );
+        let legacy: AttackSummonSettings =
+            toml::from_str(&text.replace("offset_space = \"world\"", "")).unwrap();
         assert_eq!(legacy.summons[0].offset_space(&legacy), OffsetSpace::Camera);
-        assert!(toml::from_str::<AttackSummonSettings>(&text.replace("\"world\"", "\"wrold\"")).is_err());
+        assert!(
+            toml::from_str::<AttackSummonSettings>(&text.replace("\"world\"", "\"wrold\""))
+                .is_err()
+        );
     }
 
     #[test]
@@ -1533,13 +1583,19 @@ offset_space = "camera"
         let mut alpha = [0.8, 0.9, 0.7, 0.6, 0.5, 0.4, 0.3];
         let expected = alpha;
         update_summon_visibility(SummonPreparation::Binding, alpha.each_mut());
-        assert_eq!(alpha, expected, "binding must preserve an already-started animation fade");
+        assert_eq!(
+            alpha, expected,
+            "binding must preserve an already-started animation fade"
+        );
         // Replay animation-written values through the production update seam.
         for opacity in [0.75, 0.5, 0.25, 0.0, 0.25, 0.5, 1.0] {
             alpha = [opacity, opacity, 0.7, 0.6, 0.5, 0.4, 0.3];
             let expected = alpha;
             update_summon_visibility(SummonPreparation::Updating, alpha.each_mut());
-            assert_eq!(alpha, expected, "summon update overwrote the animation's alpha");
+            assert_eq!(
+                alpha, expected,
+                "summon update overwrote the animation's alpha"
+            );
         }
     }
 
@@ -1552,7 +1608,8 @@ offset_space = "camera"
 
     #[test]
     fn humanoid_config_survives_runtime_filter_and_uses_player_creation() {
-        let settings = parse_settings(r#"
+        let settings = parse_settings(
+            r#"
 [[summons]]
 trigger_speffect = 3269
 chr_id = 0
@@ -1570,7 +1627,8 @@ trigger_speffect = 99
 chr_id = -1
 npc_param_id = 1
 animation_id = -1
-"#);
+"#,
+        );
         assert_eq!(settings.summons.len(), 2);
         let human = settings.summons[0];
         assert_eq!(character_model_name(human.chr_id), "c0000");
@@ -1598,7 +1656,8 @@ animation_id = -1
 
     #[test]
     fn summon_team_override_and_no_animation_parse_together() {
-        let settings: AttackSummonSettings = toml::from_str(r#"
+        let settings: AttackSummonSettings = toml::from_str(
+            r#"
 generated_team_type = 6
 [[summons]]
 trigger_speffect = 1
@@ -1609,7 +1668,9 @@ generated_team_type = 26
 trigger_speffect = 2
 npc_param_id = 3
 animation_id = -1
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         assert_eq!(settings.summons[0].generated_team_type(&settings), 26);
         assert_eq!(settings.summons[1].generated_team_type(&settings), 6);
         assert_eq!(settings.summons[0].animation_id, -1);

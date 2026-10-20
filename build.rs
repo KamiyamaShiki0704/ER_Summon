@@ -17,6 +17,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=RC");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
         || env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc")
@@ -87,7 +88,8 @@ fn find_rc() -> Option<PathBuf> {
         let Some(root) = env::var_os(key) else {
             continue;
         };
-        let Ok(entries) = fs::read_dir(Path::new(&root).join("Windows Kits").join("10").join("bin"))
+        let Ok(entries) =
+            fs::read_dir(Path::new(&root).join("Windows Kits").join("10").join("bin"))
         else {
             continue;
         };

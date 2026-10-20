@@ -258,28 +258,43 @@ pub(crate) fn register_event_entity_id(
     }
     // Native registration also builds the group map and notifies the event
     // manager. A round-trip through entity_id_mapping alone is not an EMEVD test.
-    let group_before = chr_set.group_id_mapping.iter()
-        .filter(|p| p.first == key && p.second == entry).count();
+    let group_before = chr_set
+        .group_id_mapping
+        .iter()
+        .filter(|p| p.first == key && p.second == entry)
+        .count();
     let character = unsafe { entry.as_ref() }.chr_ins;
     let mut native_called = false;
-    if group_before == 0 {
-        if let (Some(register), Some(character)) = (native_event_groups(chr_set), character) {
-            unsafe { register(chr_set, character.as_ptr(), entry.as_ptr()); }
-            native_called = true;
+    if group_before == 0
+        && let (Some(register), Some(character)) = (native_event_groups(chr_set), character)
+    {
+        unsafe {
+            register(chr_set, character.as_ptr(), entry.as_ptr());
         }
+        native_called = true;
     }
-    let group_after = chr_set.group_id_mapping.iter()
-        .filter(|p| p.first == key && p.second == entry).count();
+    let group_after = chr_set
+        .group_id_mapping
+        .iter()
+        .filter(|p| p.first == key && p.second == entry)
+        .count();
     crate::log_line(format_args!(
         "summon event registration: handle={handle} entity_id={key} native_groups_called={native_called} group_before={group_before} group_after={group_after} emevd_lookup=unverified"
     ));
-    if already_registered { EntityIdOutcome::AlreadyRegisteredByEngine }
-    else { EntityIdOutcome::RegisteredByDll }
+    if already_registered {
+        EntityIdOutcome::AlreadyRegisteredByEngine
+    } else {
+        EntityIdOutcome::RegisteredByDll
+    }
 }
 
-type RegisterEventGroups = unsafe extern "C" fn(*mut ChrSet<ChrIns>, *mut ChrIns, *mut ChrSetEntry<ChrIns>) -> u8;
+type RegisterEventGroups =
+    unsafe extern "C" fn(*mut ChrSet<ChrIns>, *mut ChrIns, *mut ChrSetEntry<ChrIns>) -> u8;
 
-fn event_groups_code_matches(code: &[u8]) -> bool {
+fn event_groups_code_matches(code: &[u8], ww272: bool) -> bool {
+    if ww272 {
+        return code == include_bytes!("../tests/fixtures/ww272-register-event-groups.bin");
+    }
     code == include_bytes!("../tests/fixtures/ww271-register-event-groups.bin")
 }
 
@@ -290,13 +305,32 @@ fn native_event_groups(set: &ChrSet<ChrIns>) -> Option<RegisterEventGroups> {
     let free = unsafe { *vtable.add(8) };
     let region = executable_region(free, 0x100)?;
     let base = region.AllocationBase as usize;
-    if free.checked_sub(base)? != 0x495890 { return None; }
+    let ww272 = eldenring::is_ww272();
+    let (free_rva, groups_rva) = if ww272 {
+        (0x495970, 0x4948e0)
+    } else {
+        (0x495890, 0x494800)
+    };
+    if free.checked_sub(base)? != free_rva {
+        return None;
+    }
     let free_code = unsafe { std::slice::from_raw_parts(free as *const u8, 0x100) };
-    if free_code != include_bytes!("../tests/fixtures/ww271-chrset-free-prefix.bin") { return None; }
-    let address = base.checked_add(0x494800)?;
-    if executable_region(address, 0x198)?.AllocationBase != region.AllocationBase { return None; }
+    let expected_free: &[u8] = if ww272 {
+        include_bytes!("../tests/fixtures/ww272-chrset-free-prefix.bin")
+    } else {
+        include_bytes!("../tests/fixtures/ww271-chrset-free-prefix.bin")
+    };
+    if free_code != expected_free {
+        return None;
+    }
+    let address = base.checked_add(groups_rva)?;
+    if executable_region(address, 0x198)?.AllocationBase != region.AllocationBase {
+        return None;
+    }
     let code = unsafe { std::slice::from_raw_parts(address as *const u8, 0x198) };
-    if !event_groups_code_matches(code) { return None; }
+    if !event_groups_code_matches(code, ww272) {
+        return None;
+    }
     Some(unsafe { std::mem::transmute::<usize, RegisterEventGroups>(address) })
 }
 
@@ -394,7 +428,7 @@ fn clear_player_lock_on(world_chr_man: &mut WorldChrMan, handle: FieldInsHandle)
 
 /// Clears the character creator's reference to a character that is being freed.
 fn clear_debug_creator_pointer(world_chr_man: &mut WorldChrMan, chr: *const ChrIns) {
-    let creator = &mut world_chr_man.debug_chr_creator;
+    let creator = world_chr_man.debug_chr_creator_mut();
     if let Some(last) = creator.last_created_chr
         && std::ptr::eq(last.as_ptr().cast_const().cast::<ChrIns>(), chr)
     {
@@ -579,11 +613,11 @@ mod tests {
     #[test]
     fn event_groups_binding_rejects_modified_or_truncated_native_body() {
         let code = include_bytes!("../tests/fixtures/ww271-register-event-groups.bin");
-        assert!(event_groups_code_matches(code));
-        assert!(!event_groups_code_matches(&code[..code.len()-1]));
+        assert!(event_groups_code_matches(code, false));
+        assert!(!event_groups_code_matches(&code[..code.len() - 1], false));
         let mut modified = *code;
         modified[0x15e] ^= 1; // event-manager notification call must stay intact
-        assert!(!event_groups_code_matches(&modified));
+        assert!(!event_groups_code_matches(&modified, false));
     }
 
     #[test]
@@ -700,4 +734,17 @@ mod retirement_binding_tests {
         bad_task[0x1a] ^= 1;
         assert!(!task_cleanup_matches(&bad_task));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn ww272_lifecycle_fixtures_and_negative_controls() {
+    let code = include_bytes!("../tests/fixtures/ww272-register-event-groups.bin");
+    assert!(event_groups_code_matches(code, true));
+    let mut bad = *code;
+    bad[0x15e] ^= 1;
+    assert!(!event_groups_code_matches(&bad, true));
+    let free = include_bytes!("../tests/fixtures/ww272-chrset-free-prefix.bin");
+    assert_eq!(owner_lookup_address(free, 0x495970), Some(0xe1d770));
+    assert_eq!(detach_address(free, 0x495970), Some(0x494ff0));
 }

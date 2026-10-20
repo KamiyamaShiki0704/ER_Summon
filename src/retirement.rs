@@ -49,14 +49,14 @@ pub(crate) fn enqueue(value: Retired) {
 /// World transitions can invalidate resources even when this allocation was
 /// detached. Leak quarantined storage rather than invoking a stale destructor.
 pub(crate) fn quarantine_all(reason: &str) {
-    if let Ok(mut queue) = QUEUE.lock() {
-        if !queue.is_empty() {
-            crate::log_line(format_args!(
-                "summon retirement: phase=quarantined count={} reason={reason}; allocations retained until process exit",
-                queue.len()
-            ));
-            queue.clear();
-        }
+    if let Ok(mut queue) = QUEUE.lock()
+        && !queue.is_empty()
+    {
+        crate::log_line(format_args!(
+            "summon retirement: phase=quarantined count={} reason={reason}; allocations retained until process exit",
+            queue.len()
+        ));
+        queue.clear();
     }
 }
 
@@ -93,9 +93,9 @@ fn word(address: usize) -> Option<usize> {
 }
 
 fn count_vector(world: usize, offset: usize, stride: usize, pointer: usize) -> Option<usize> {
-    let first = word(world + offset + 8)?;
-    let last = word(world + offset + 16)?;
-    let end = word(world + offset + 24)?;
+    let first = word(world + eldenring::cs::world_chr_man_field_offset(offset) + 8)?;
+    let last = word(world + eldenring::cs::world_chr_man_field_offset(offset) + 16)?;
+    let end = word(world + eldenring::cs::world_chr_man_field_offset(offset) + 24)?;
     let bytes = last.checked_sub(first)?;
     if last > end || bytes % stride != 0 || bytes / stride > 65536 {
         return None;
@@ -121,7 +121,7 @@ fn references(world: usize, pointer: usize) -> Option<usize> {
         count += count_vector(world, offset, stride, pointer)?;
     }
     // WorldChrMan_PostPhysics also traverses this (character,next) chain.
-    let mut node = word(world + 0x1e6a8)?;
+    let mut node = word(world + eldenring::cs::world_chr_man_field_offset(0x1e6a8))?;
     let mut visited = 0;
     while node != 0 {
         if visited >= 65536 {
